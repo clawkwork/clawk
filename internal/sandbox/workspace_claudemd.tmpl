@@ -1,0 +1,108 @@
+# Sandbox: {{.Name}}
+
+You are running inside a clawk VM on the user's Mac, not on their laptop
+directly. This environment is purpose-built for agent work — it's cheap to
+break and quick to recreate, so prefer bold, task-focused actions over
+defensive ones.
+
+## Filesystem layout
+
+- `{{.WorkspaceRoot}}/` — this directory. Each subdirectory is a git worktree
+  checked out on the sandbox branch:
+{{- if .Phases}}
+{{- range .Phases}}
+  - `{{.Name}}/` (branch `{{.Branch}}`, from `{{.Repo}}`)
+{{- end}}
+{{- else}}
+  - (no worktrees attached yet)
+{{- end}}
+- `~/.claude/skills/`, `~/.claude/agents/`, `~/.claude/commands/` — live
+  read-write mounts from the host. Edits propagate back; think of them as
+  the user's personal Claude Code config.
+- `~/.claude/settings.json` and `~/.claude/CLAUDE.md` — snapshotted from the
+  host at VM create. Edits here are local to this sandbox.
+- Everything else (`/`, `/etc`, `/opt`) is VM-local and disposable; nothing
+  outside the worktrees is persisted when the sandbox is destroyed.
+
+## Persistence: what survives `destroy`
+
+- **Yes**: commits + changes inside any worktree under `{{.WorkspaceRoot}}/`
+  (real git worktrees mounted from the host).
+- **Yes**: edits under `~/.claude/skills|agents|commands` (live mounts back to
+  the host).
+- **No**: anything else. Apt installs, `~/.bashrc` edits, binaries in `/tmp`,
+  shell history, npm caches outside the worktree — all gone.
+
+Rule of thumb: if a generated artifact matters, put it in a worktree or push
+it somewhere. Otherwise assume it evaporates.
+
+## Pre-installed tools
+
+The base image ships with these ready on PATH. Don't `sudo apt install` or
+curl-pipe installers for these — they're already here:
+
+- **Languages**: `go` (1.24), `node` (22 LTS), `pnpm`, `python3` (+ `pip`,
+  `venv`), `rustc`/`cargo`, `zig`, `bun`.
+- **Package managers**: `uv` (Python), `pnpm` (Node), `cargo` (Rust).
+- **CLI**: `git`, `gh`, `curl`, `wget`, `jq`, `ripgrep` (`rg`), `make`,
+  `build-essential` (gcc/g++), `unzip`, `vim`, `zsh`.
+- **AI CLIs**: `claude`, `codex`.
+
+If you think something else should be pre-installed permanently, tell the
+user — it goes into `~/.clawk/provision.sh` and requires a one-time
+`clawk image build`. Ad-hoc `apt install` in a running sandbox works but
+is slow (emulated arm64) and vanishes on destroy.
+
+## Dev servers and port forwarding
+
+When you start a dev server inside the VM, **bind to `0.0.0.0`, not
+`127.0.0.1`**. `localhost` inside the VM is unreachable from the host; the
+port has to be forwarded by vz/gvproxy.
+
+Common patterns:
+
+- Node/Vite: `pnpm dev -- --host 0.0.0.0`
+- Go: `./server -addr :3000` (Go's default bind is `0.0.0.0` — fine as-is)
+- Python: `uvicorn app:app --host 0.0.0.0 --port 8000`
+
+Once the server is bound, tell the user to run `clawk forward add
+<sandbox> <port>` on the host (defaults host port = guest port). After that
+`localhost:<port>` on their Mac hits the server. Don't forget to mention
+the command — the forward isn't automatic.
+
+## Network
+
+Egress is allowlisted. DNS resolves everything, but TCP connects to unlisted
+hosts are refused. Common package managers, registries, and
+`api.anthropic.com` are pre-allowed. If a request fails with
+`connection refused`, tell the user the blocked host so they can add it via
+`clawk network allow <sandbox> <domain>` — it applies to the running VM
+immediately, so just retry after they confirm. If you're unsure which host
+was refused, the user can run `clawk network denials <sandbox>` on the host
+to see every blocked connection by hostname.
+
+## Git and SSH
+
+- Git identity is the user's host identity (`git config user.name/email` copied).
+- GitHub HTTPS URLs are rewritten to `git@github.com:` — pushes go through
+  the user's SSH agent (1Password, ssh-agent, etc.) forwarded from the host.
+  You never need HTTPS credentials.
+- `github.com` host keys are preseeded; `git push` works with no prompt.
+
+## Useful commands
+
+- Phases are orchestrated by `clawk` on the host. Inside the VM, just use
+  `git`, `gh`, language toolchains, etc. normally.
+- To open PRs across every phase at once, the user runs
+  `clawk pr <sandbox>` from the host.
+- Don't commit this `CLAUDE.md` into any repo — it's under
+  `{{.WorkspaceRoot}}/`, not inside a worktree.
+{{- if .Instructions}}
+
+## Project instructions
+
+Namespace- and repo-specific instructions for this sandbox:
+{{range .Instructions}}
+{{.}}
+{{end -}}
+{{end}}

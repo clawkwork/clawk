@@ -1,0 +1,78 @@
+# Builds the sound-enabled clawk guest kernel and publishes the vmlinux
+# binaries to a GitHub release, so voice dictation has a virtio-snd driver
+# inside the VM (the stock Kata kernel has none — see images/guest-kernel).
+#
+# ON-DEMAND ONLY: kernel builds are slow and the kernel changes rarely, so
+# this never runs on an ordinary push. It triggers on manual dispatch and on
+# pushes that actually touch the kernel build inputs.
+#
+# Output: a release tagged `guest-kernel-<kver>-snd` with assets vmlinux-arm64
+# and vmlinux-amd64. Point a sandbox at one with `vm ( kernel <asset-url> )`
+# (or, once verified, set it as the default in machine/kernel/kernel.go).
+name: build-guest-kernel
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - images/guest-kernel/**
+      - .github/workflows/build-guest-kernel.yml
+
+permissions:
+  contents: write   # create the release / upload assets
+
+env:
+  KERNEL_VERSION: "6.18.15"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm   # build arm64 natively
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison libelf-dev libssl-dev bc \
+            cpio kmod git curl xz-utils
+
+      - name: Build kernel
+        run: OUT="$PWD/vmlinux-${{ matrix.arch }}" images/guest-kernel/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmlinux-${{ matrix.arch }}
+          path: vmlinux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: vmlinux-*
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: guest-kernel-${{ env.KERNEL_VERSION }}-snd
+          name: Guest kernel ${{ env.KERNEL_VERSION }} (sound-enabled)
+          body: |
+            clawk guest kernel ${{ env.KERNEL_VERSION }}, identical to Kata's
+            pinned config plus virtio-snd (see images/guest-kernel). Point a
+            sandbox at an asset with `vm ( kernel <url> )`.
+          files: dist/vmlinux-*
+          fail_on_unmatched_files: true

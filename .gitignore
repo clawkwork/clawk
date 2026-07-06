@@ -1,0 +1,18 @@
+# Build artifacts
+/clawk
+/bin/
+machine/bin/
+machine/smoke-alpine
+machine/smoke-firecracker
+*.exe
+
+# Local cruft
+.DS_Store
+third_party/misc
+debug-logs/
+*.panic
+*.log
+
+# Local Claude Code settings and skills (personal, not shared)
+.claude/settings.local.json
+.claude/skills/

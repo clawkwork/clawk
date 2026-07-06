@@ -1,0 +1,15 @@
+clawk
+Copyright 2026 The clawk Authors
+
+This product depends on and includes software developed by third parties
+under their original licenses:
+
+- github.com/clawkwork/gvisor-tap-vsock — a fork of
+  github.com/containers/gvisor-tap-vsock (Apache License 2.0), patched so the
+  TCP forwarder consults clawk's egress allow-list before dialing. Pulled in
+  via a go.mod replace directive; see that repository for the LICENSE.
+
+- machine/internal/ext4/ — a fork of github.com/Microsoft/hcsshim
+  ext4/tar2ext4 + ext4/internal/compactext4 (MIT License),
+  Copyright (c) 2015 Microsoft. See machine/internal/ext4/LICENSE and
+  machine/internal/ext4/README.md for the local changes.

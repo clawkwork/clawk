@@ -1,0 +1,85 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly.
+labels: [bug]
+body:
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Existing issues
+      options:
+        - label: I searched existing issues and didn't find this.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened / what you expected
+      description: Be specific — include exact commands and output where you can.
+      placeholder: |
+        What happened:
+        What you expected instead:
+    validations:
+      required: true
+
+  - type: input
+    id: clawk-version
+    attributes:
+      label: clawk version
+      description: Output of `clawk version`.
+      placeholder: clawk 0.x.y (commit abcdef)
+    validations:
+      required: true
+
+  - type: input
+    id: host-os
+    attributes:
+      label: Host OS + chip
+      placeholder: macOS 15.5, M3 Pro
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - vz (macOS)
+        - firecracker (Linux)
+        - not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sandbox-mode
+    attributes:
+      label: Sandbox mode
+      options:
+        - cwd mode (clawk)
+        - ticket mode (clawk work)
+        - other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >
+        Paste `clawk doctor --json` output. For VM/boot issues, run `clawk
+        debug dump <sandbox>` and attach the resulting bundle's path — logs
+        also live under `~/.clawk/namespaces/<ns>/vms/<name>/` (`vzd.log`,
+        `console.log`). Redact anything sensitive before pasting or
+        attaching.
+    validations:
+      required: false

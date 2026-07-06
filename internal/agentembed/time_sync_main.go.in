@@ -1,0 +1,164 @@
+// clawk-time-sync runs in the guest VM and keeps the guest's wallclock
+// in sync with the host's, using a host→guest vsock push protocol.
+//
+// Why this exists: macOS's Virtualization.framework doesn't expose a
+// paravirtualised timesource, so when the host sleeps the guest's
+// wallclock simply stops while the host's keeps advancing. On wake, the
+// guest is suddenly minutes-to-hours behind, which breaks anything
+// timestamp-validated (TLS, JWTs, claude API calls, git http auth, …).
+//
+// Docker Desktop solves this by running a custom SNTP server inside
+// vpnkit and an sntpc client in the VM. We do the same shape in fewer
+// lines: clawk's daemon dials vsock port 1025 every ~10s and writes
+// 8 bytes of UnixNano. This program receives, computes drift, and if
+// drift exceeds the threshold calls clock_settime(CLOCK_REALTIME).
+//
+// Drop-in independent of clawk-pty-agent: separate binary, separate
+// systemd unit, separate vsock port. If the agent crashes, time-sync
+// keeps running; if time-sync fails, the agent keeps running.
+//
+// References:
+//   - https://www.docker.com/blog/addressing-time-drift-in-docker-desktop-for-mac/
+//   - https://docs.docker.com/ai/sandboxes/troubleshooting/
+
+//go:build linux
+
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"sync/atomic"
+	"time"
+
+	"github.com/mdlayher/vsock"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	// vsockPort is the AF_VSOCK port the daemon pushes time to.
+	// Different from the agent's 1024 to keep the protocols cleanly
+	// separated.
+	vsockPort = 1025
+
+	// driftThreshold is the minimum delta (in absolute terms) before
+	// we call clock_settime. Smaller delts are noise from RTT;
+	// adjusting on every push would only churn the clock for no
+	// benefit. The push interval is 10s on the host side, so a 200ms
+	// threshold means we usually do nothing.
+	driftThreshold = 200 * time.Millisecond
+
+	// largeJump is how big a forward delta has to be for us to log
+	// the adjustment at INFO level. This is the "host slept" signal —
+	// usually 30s+. Anything below this is normal drift correction
+	// and gets logged at DEBUG only (i.e. dropped by default).
+	largeJump = 30 * time.Second
+)
+
+func main() {
+	port := flag.Uint("port", vsockPort, "AF_VSOCK port to listen on")
+	logPath := flag.String("log", "", "log file (default: stderr)")
+	flag.Parse()
+
+	logger := log.New(os.Stderr, "clawk-time-sync: ", log.LstdFlags)
+	if *logPath != "" {
+		f, err := os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			logger.Fatalf("open log %q: %v", *logPath, err)
+		}
+		logger = log.New(f, "clawk-time-sync: ", log.LstdFlags)
+	}
+
+	l, err := vsock.Listen(uint32(*port), nil)
+	if err != nil {
+		logger.Fatalf("vsock listen %d: %v", *port, err)
+	}
+	logger.Printf("listening on AF_VSOCK port=%d cid=ANY", *port)
+
+	// updates is the count of clock_settime calls; surfaced in the
+	// occasional log line so an operator can grep "applied" in the
+	// guest journal and see the running total.
+	var updates atomic.Uint64
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logger.Printf("accept: %v", err)
+			continue
+		}
+		// Each push is independent: read 8 bytes, decide, close. No
+		// reason to spin a goroutine — pushes are sequential and
+		// take microseconds.
+		handle(conn, logger, &updates)
+	}
+}
+
+func handle(conn net.Conn, logger *log.Logger, updates *atomic.Uint64) {
+	defer conn.Close()
+	// Bound the read so a malicious peer can't park us forever. The
+	// daemon writes 8 bytes immediately; 5s is gigatons of margin.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		logger.Printf("set deadline: %v", err)
+		return
+	}
+	var buf [8]byte
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		// EOF on a healthy push that was just `WriteUint64 + close`
+		// looks like ErrUnexpectedEOF if we've read 0 bytes; treat
+		// any read error as "skip this push" silently.
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			logger.Printf("read: %v", err)
+		}
+		return
+	}
+
+	hostNanos := int64(binary.BigEndian.Uint64(buf[:]))
+	hostT := time.Unix(0, hostNanos)
+	guestT := time.Now()
+	drift := hostT.Sub(guestT)
+
+	abs := drift
+	if abs < 0 {
+		abs = -abs
+	}
+	if abs < driftThreshold {
+		// Within the noise floor — do nothing.
+		return
+	}
+
+	// Apply correction. clock_settime(CLOCK_REALTIME) requires
+	// CAP_SYS_TIME; the systemd unit must run this binary as root
+	// (User=root in clawk-time-sync.service).
+	ts := unix.NsecToTimespec(hostNanos)
+	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &ts); err != nil {
+		logger.Printf("clock_settime: %v (drift was %s)", err, drift)
+		return
+	}
+	count := updates.Add(1)
+
+	// Always log large jumps (host-sleep signature). Suppress
+	// sub-largeJump corrections after the first ~10 to avoid spam
+	// during normal drift dampening; an operator running journalctl
+	// -fu clawk-time-sync still sees the first batch of corrections,
+	// then it goes quiet.
+	if abs >= largeJump {
+		logger.Printf("applied %s correction (host=%s, guest was %s) — likely host sleep",
+			drift.Round(time.Millisecond), hostT.UTC().Format(time.RFC3339Nano), guestT.UTC().Format(time.RFC3339Nano))
+		return
+	}
+	if count <= 10 || count%100 == 0 {
+		logger.Printf("applied %s correction (#%d total)", drift.Round(time.Millisecond), count)
+	}
+}
+
+// guard against unused-imports under future feature gates
+var _ = fmt.Sprintf

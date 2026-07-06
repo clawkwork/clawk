@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose something new or a change in behavior.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        clawk deliberately keeps a small surface. Features that can live in
+        a `clawk.mod` hook or an OCI image (instead of clawk itself) may be
+        declined in favor of that.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What are you trying to do, and where does clawk get in the way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including workarounds via `clawk.mod` hooks or a custom OCI image.
+    validations:
+      required: false

@@ -1,0 +1,901 @@
+// clawk-pty-agent runs in the guest VM and serves PTY-backed shell
+// sessions over AF_VSOCK. It pairs with the Mac-side client in
+// internal/vsockclient. The wire protocol is defined in
+// internal/vsockproto and inlined here so this file builds standalone
+// inside the guest without pulling in the parent module.
+//
+// Why standalone: it's cross-compiled on the host (GOOS=linux,
+// CGO_ENABLED=0) by internal/guestbuild and injected into the rootfs,
+// so it must build without pulling in the parent module. Keeping it
+// dependency-light (only golang.org/x/sys, mdlayher/vsock, and
+// creack/pty) keeps that build fast.
+//
+// Build tag is //go:build linux because the agent listens on AF_VSOCK
+// (Linux-only) via mdlayher/vsock.
+
+//go:build linux
+
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"os/user"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/creack/pty"
+	"github.com/mdlayher/vsock"
+)
+
+// ────────────────────────────────────────────────────────────────────────
+// Wire protocol — kept in lock-step with internal/vsockproto/protocol.go
+// in the parent repo. Any change there must be mirrored here.
+// ────────────────────────────────────────────────────────────────────────
+
+type frameType byte
+
+const (
+	frameHandshake frameType = 0x01
+	frameData      frameType = 0x02
+	frameWinsize   frameType = 0x03
+	frameExit      frameType = 0x04
+	frameSignal    frameType = 0x05
+)
+
+const (
+	// protoVersion / minProtoVersion mirror vsockproto.ProtoVersion and
+	// vsockproto.MinSupportedProtoVersion (see the compatibility policy
+	// there). The agent accepts the whole range, never a single value:
+	// this binary is baked into the sandbox disk at create and outlives
+	// host upgrades.
+	protoVersion    uint32 = 1
+	minProtoVersion uint32 = 1
+	maxPayloadBytes        = 64 * 1024
+	frameHeaderSize        = 5
+)
+
+type handshake struct {
+	ProtoVersion  uint32   `json:"v"`
+	Cmd           string   `json:"cmd,omitempty"`
+	Args          []string `json:"args,omitempty"`
+	Env           []string `json:"env,omitempty"`
+	Cwd           string   `json:"cwd,omitempty"`
+	User          string   `json:"user,omitempty"`
+	Term          string   `json:"term,omitempty"`
+	Rows          uint16   `json:"rows,omitempty"`
+	Cols          uint16   `json:"cols,omitempty"`
+	Distinguisher string   `json:"distinguisher,omitempty"`
+	// (Tags must remain in lock-step with internal/vsockproto/protocol.go.
+	//  Test TestHandshakeRoundTrip catches drift.)
+}
+
+var errFrameTooLarge = errors.New("frame payload exceeds max")
+
+func writeFrame(w io.Writer, t frameType, payload []byte) error {
+	if len(payload) > maxPayloadBytes {
+		return errFrameTooLarge
+	}
+	var hdr [frameHeaderSize]byte
+	hdr[0] = byte(t)
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func readFrame(r io.Reader) (frameType, []byte, error) {
+	var hdr [frameHeaderSize]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	t := frameType(hdr[0])
+	n := binary.BigEndian.Uint32(hdr[1:5])
+	if n > maxPayloadBytes {
+		return 0, nil, fmt.Errorf("%w: announced %d", errFrameTooLarge, n)
+	}
+	if n == 0 {
+		return t, nil, nil
+	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	return t, payload, nil
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// VSOCK listener
+//
+// We delegate to mdlayher/vsock instead of rolling our own
+// unix.Socket/Bind/Listen + net.FileListener: the stdlib's FileListener
+// only knows TCP and Unix sockets, so wrapping an AF_VSOCK fd with it
+// returns EINVAL and the agent silently never accepts. mdlayher/vsock
+// implements a proper net.Listener around the same syscalls.
+// ────────────────────────────────────────────────────────────────────────
+
+func listenVSock(port uint32) (net.Listener, error) {
+	l, err := vsock.Listen(port, nil)
+	if err != nil {
+		return nil, fmt.Errorf("vsock.Listen(%d): %w", port, err)
+	}
+	return l, nil
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Session: one client connection ↔ one PTY ↔ one child process.
+// ────────────────────────────────────────────────────────────────────────
+
+type session struct {
+	conn net.Conn
+	log  *log.Logger
+}
+
+func (s *session) serve() {
+	defer s.conn.Close()
+
+	// Handshake first — bounded read deadline catches wedged clients.
+	if err := s.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		s.log.Printf("set read deadline: %v", err)
+		return
+	}
+	t, payload, err := readFrame(s.conn)
+	if err != nil {
+		s.log.Printf("read handshake: %v", err)
+		return
+	}
+	if t != frameHandshake {
+		s.log.Printf("first frame is not handshake (type=%d)", t)
+		return
+	}
+	if err := s.conn.SetReadDeadline(time.Time{}); err != nil {
+		s.log.Printf("clear read deadline: %v", err)
+		return
+	}
+
+	var h handshake
+	if err := json.Unmarshal(payload, &h); err != nil {
+		s.fail(1, "unmarshal handshake: %v", err)
+		return
+	}
+	if h.ProtoVersion < minProtoVersion || h.ProtoVersion > protoVersion {
+		// The message lands verbatim in the user's terminal (fail writes
+		// it as pty data), so make it actionable: this skew means the
+		// sandbox disk was created by a different clawk release.
+		s.fail(1, "clawk protocol mismatch: client speaks v%d, this sandbox's guest agent speaks v%d–v%d — recreate the sandbox with 'clawk destroy && clawk'",
+			h.ProtoVersion, minProtoVersion, protoVersion)
+		return
+	}
+
+	// Resolve target user. Empty → run as the agent itself (typically root).
+	var cred *syscall.Credential
+	var homeDir string
+	var loginUser string
+	if h.User != "" {
+		u, err := user.Lookup(h.User)
+		if err != nil {
+			s.fail(1, "user lookup %q: %v", h.User, err)
+			return
+		}
+		uid, err := strconv.Atoi(u.Uid)
+		if err != nil {
+			s.fail(1, "parse uid %q: %v", u.Uid, err)
+			return
+		}
+		gid, err := strconv.Atoi(u.Gid)
+		if err != nil {
+			s.fail(1, "parse gid %q: %v", u.Gid, err)
+			return
+		}
+		gidStrs, err := u.GroupIds()
+		if err != nil {
+			s.fail(1, "group ids for %q: %v", h.User, err)
+			return
+		}
+		gids := make([]uint32, 0, len(gidStrs))
+		for _, gs := range gidStrs {
+			g, err := strconv.Atoi(gs)
+			if err != nil {
+				continue
+			}
+			gids = append(gids, uint32(g))
+		}
+		cred = &syscall.Credential{
+			Uid:    uint32(uid),
+			Gid:    uint32(gid),
+			Groups: gids,
+		}
+		homeDir = u.HomeDir
+		loginUser = u.Username
+	}
+
+	// The user's login shell from /etc/passwd — bash isn't a given on
+	// OCI-image sandboxes (alpine ships busybox sh only).
+	shell := loginShell(loginUser)
+	cmdPath := h.Cmd
+	if cmdPath == "" {
+		cmdPath = shell
+	}
+	cmd := buildSpawn(cmdPath, h)
+
+	cwd := h.Cwd
+	if cwd == "" {
+		cwd = homeDir
+	}
+	if cwd == "" {
+		cwd = "/"
+	}
+	cmd.Dir = cwd
+
+	cmd.Env = buildChildEnv(h, homeDir, loginUser, shell)
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+	}
+	if cred != nil {
+		cmd.SysProcAttr.Credential = cred
+	}
+
+	rows, cols := h.Rows, h.Cols
+	if rows == 0 {
+		rows = 24
+	}
+	if cols == 0 {
+		cols = 80
+	}
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
+	if err != nil {
+		// 127 mirrors the shell's command-not-found convention — the
+		// usual cause here is a Cmd the image doesn't ship.
+		s.fail(127, "start %q: %v", cmdPath, err)
+		return
+	}
+	defer func() { _ = ptmx.Close() }()
+
+	s.log.Printf("started: cmd=%q user=%s pid=%d size=%dx%d",
+		cmdPath, loginUser, cmd.Process.Pid, rows, cols)
+
+	// Three independent things can end a session:
+	//   1. The child process exits (claude /quit, exit, etc.)
+	//   2. The client closes the conn (Mac terminal closed, sleep wedged)
+	//   3. Something fatal in a pump (write error, decode error)
+	//
+	// Whichever fires first must tear the others down so we always
+	// reach the FrameExit + cleanup path. The previous shape only
+	// noticed (2) — a child exit left the conn-read loop parked
+	// forever, the client never saw FrameExit, and the user was
+	// stuck on the host shell after typing /quit in claude.
+	//
+	// New shape:
+	//   - PTY→conn pump runs in a goroutine, exits on PTY EOF.
+	//   - conn→PTY pump runs in a goroutine, exits on read error.
+	//   - cmd.Wait() runs in a goroutine, completes on child exit.
+	//   - main goroutine selects across all three; the first to
+	//     complete drives shutdown.
+
+	clientGone := make(chan struct{})
+	ptyGone := make(chan struct{})
+	waitDone := make(chan error, 1)
+
+	// PTY → conn pump.
+	go func() {
+		defer close(ptyGone)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := ptmx.Read(buf)
+			if n > 0 {
+				if werr := writeFrame(s.conn, frameData, buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// conn → PTY pump.
+	go func() {
+		defer close(clientGone)
+		for {
+			t, payload, err := readFrame(s.conn)
+			if err != nil {
+				if !errors.Is(err, io.EOF) && !isClosedConn(err) {
+					s.log.Printf("read frame: %v", err)
+				}
+				return
+			}
+			switch t {
+			case frameData:
+				if _, werr := ptmx.Write(payload); werr != nil {
+					s.log.Printf("pty write: %v", werr)
+					return
+				}
+			case frameWinsize:
+				if len(payload) < 4 {
+					continue
+				}
+				rows := binary.BigEndian.Uint16(payload[0:2])
+				cols := binary.BigEndian.Uint16(payload[2:4])
+				if err := pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols}); err != nil {
+					s.log.Printf("setsize: %v", err)
+				}
+			default:
+				// Unknown frames silently ignored — forward-compat.
+			}
+		}
+	}()
+
+	// Reaper: wait for the child. cmd.Wait() can only be called once,
+	// so it lives in exactly this goroutine; everyone else reads from
+	// waitDone.
+	go func() { waitDone <- cmd.Wait() }()
+
+	// First to fire drives shutdown.
+	select {
+	case <-waitDone:
+		// Child exited (claude /quit, etc.). Drain any final PTY
+		// output the kernel hasn't delivered yet, then close conn so
+		// the client unblocks on its next read.
+		s.log.Printf("child exited; draining pty")
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		select {
+		case <-ptyGone:
+		case <-drainCtx.Done():
+		}
+		drainCancel()
+	case <-clientGone:
+		// Client disconnected (mac sleep wedge, Ctrl-C, terminal
+		// closed). Close the PTY master to signal hang-up to the
+		// child via the kernel's standard SIGHUP path; the child
+		// has 2 seconds to exit gracefully before we SIGKILL.
+		//
+		// We deliberately do NOT preserve the child across client
+		// disconnects. Persistence is delegated to the agent
+		// itself: claude --resume reads conversation state from
+		// ~/.claude/projects/ which we mount persistent across
+		// destroy/recreate. Same model as Docker Sandbox — each
+		// attach is a fresh exec, no session multiplexer in the
+		// middle. Cost: TUI re-renders on reconnect (cheap).
+		s.log.Printf("client gone; closing pty")
+		_ = ptmx.Close()
+		select {
+		case <-waitDone:
+		case <-time.After(2 * time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-waitDone
+		}
+	case <-ptyGone:
+		// PTY closed without the reaper observing exit yet. Could
+		// happen on a SIGKILL race; give Wait a tick to catch up.
+		select {
+		case <-waitDone:
+		case <-time.After(time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				<-waitDone
+			}
+		}
+	}
+
+	// Stop both pumps. Closing the PTY makes ptmx.Read return; closing
+	// the conn makes readFrame return.
+	_ = ptmx.Close()
+	_ = s.conn.SetReadDeadline(time.Now())
+
+	exitCode := int32(0)
+	if cmd.ProcessState != nil {
+		exitCode = int32(cmd.ProcessState.ExitCode())
+	}
+	// Best-effort: client may already be gone.
+	_ = writeExitFrame(s.conn, exitCode)
+	s.log.Printf("session ended: exit=%d", exitCode)
+}
+
+func writeExitFrame(w io.Writer, code int32) error {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(code))
+	return writeFrame(w, frameExit, b[:])
+}
+
+// fail reports a pre-exec error to the client as visible output plus an
+// exit frame, then logs it. Without the frames the client only ever sees
+// "agent disconnected before exit frame: EOF" — indistinguishable from a
+// wedged VM.
+func (s *session) fail(code int32, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	s.log.Printf("%s", msg)
+	_ = writeFrame(s.conn, frameData, []byte("clawk-pty-agent: "+msg+"\r\n"))
+	_ = writeExitFrame(s.conn, code)
+}
+
+// buildSpawn constructs the child the agent runs: just the requested
+// command with its args. No session multiplexer wrapper.
+//
+// Earlier versions wrapped this in `abduco -Af <key> ...` to keep the
+// child alive across client disconnects. Removed because: (1) every
+// layer (alt-screen patch, static-link build, multi-attach session
+// keys) was a recurring source of bugs; (2) Docker Sandbox proved at
+// scale that no multiplexer is needed if the agent itself persists
+// state, which claude does (`claude --resume` reads
+// ~/.claude/projects/, mounted persistent across destroy cycles).
+//
+// h.Distinguisher is now unused but kept on the wire for protocol
+// stability — old hosts can still send it, we just ignore it.
+func buildSpawn(cmdPath string, h handshake) *exec.Cmd {
+	return exec.Command(cmdPath, h.Args...)
+}
+
+// loginShell resolves username's shell from /etc/passwd. Falls back to
+// bash when present, else POSIX sh.
+func loginShell(username string) string {
+	if username != "" {
+		if data, err := os.ReadFile("/etc/passwd"); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				fields := strings.Split(line, ":")
+				if len(fields) >= 7 && fields[0] == username && fields[6] != "" {
+					return fields[6]
+				}
+			}
+		}
+	}
+	if _, err := os.Stat("/bin/bash"); err == nil {
+		return "/bin/bash"
+	}
+	return "/bin/sh"
+}
+
+// defaultPATH covers the clawk-dev image's tool prefixes plus the
+// standard locations, used as a fallback; images that ship an image-env
+// override it with their config Env's PATH.
+const defaultPATH = "/opt/node/bin:/opt/rust/cargo/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+func buildChildEnv(h handshake, home, loginUser, shell string) []string {
+	env := map[string]string{
+		"PATH":          defaultPATH,
+		"SHELL":         shell,
+		"LANG":          "C.UTF-8",
+		"TERM":          pickTerm(h.Term),
+		"SSH_AUTH_SOCK": guestSSHAgentSocket,
+
+		// Disable JavaScriptCore's JIT. claude-code's "native binary"
+		// is actually a Bun standalone executable, and Bun is built on
+		// JSC. The aarch64 JIT misemits illegal instructions
+		// intermittently — surfaces as `panic: Illegal instruction at
+		// address 0xXXXXXXXX` mid-session, killing claude entirely.
+		// Setting JSC_useJIT=0 forces the LLInt interpreter instead.
+		// Significant slowdown (~7x in benchmarks per WebKit's own
+		// numbers), but the alternative is "claude crashes after a
+		// few minutes." Honored by JSC because the source code reads
+		// env vars of the form JSC_<option-name> at startup.
+		// Non-JSC programs (Node, bash, codex via Node, etc.) ignore
+		// these vars, so setting them globally is safe.
+		"JSC_useJIT": "0",
+
+		// Sandbox identity. Match the env-var conventions Docker
+		// Sandbox sets so downstream tools that branch on
+		// "am I in a sandbox?" or read WORKSPACE_DIR Just Work.
+		// IS_SANDBOX is also a useful guard for setup scripts the
+		// user may want to run only inside the sandbox.
+		"IS_SANDBOX": "1",
+	}
+	// OCI sandboxes: the image config's Env (PATH, toolchain vars like
+	// GOLANG_VERSION) is baked into the rootfs at disk-build time. It
+	// wins over the static defaults above — the image knows where its
+	// tools live — except for keys the agent must own. Absent on images
+	// the disk builder didn't tag, where the static defaults apply.
+	for k, v := range imageEnv() {
+		switch k {
+		case "TERM", "SSH_AUTH_SOCK", "JSC_useJIT", "IS_SANDBOX",
+			"HOME", "USER", "LOGNAME", "SHELL":
+			continue
+		}
+		env[k] = v
+	}
+	if h.Cwd != "" {
+		env["WORKSPACE_DIR"] = h.Cwd
+	}
+	if home != "" {
+		env["HOME"] = home
+	}
+	if loginUser != "" {
+		env["USER"] = loginUser
+		env["LOGNAME"] = loginUser
+	}
+	for _, e := range h.Env {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok {
+			continue
+		}
+		env[k] = v
+	}
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
+// imageEnv loads the environment the OCI image was built to run with —
+// written to /etc/clawk/image-env by the disk builder (machine/oci).
+// Returns an empty map when the file doesn't exist.
+func imageEnv() map[string]string {
+	out := map[string]string{}
+	data, err := os.ReadFile("/etc/clawk/image-env")
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok && k != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func pickTerm(t string) string {
+	if t == "" {
+		return "xterm-256color"
+	}
+	return t
+}
+
+func isClosedConn(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var ne *net.OpError
+	if errors.As(err, &ne) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Main
+// ────────────────────────────────────────────────────────────────────────
+
+func main() {
+	port := flag.Uint("port", 1024, "AF_VSOCK port to listen on")
+	logPath := flag.String("log", "", "log file (default: stderr)")
+	flag.Parse()
+
+	// When PID 1 (clawk-init) spawns the agent, the process environment
+	// is empty — and exec.LookPath consults OUR env, not the child's,
+	// so every bare command name ("bash", "claude") would fail with
+	// "executable file not found in $PATH". Give ourselves the image's
+	// PATH (or the default) before the first session.
+	if p := imageEnv()["PATH"]; p != "" {
+		_ = os.Setenv("PATH", p)
+	} else if os.Getenv("PATH") == "" {
+		_ = os.Setenv("PATH", defaultPATH)
+	}
+
+	logger := log.New(os.Stderr, "clawk-pty-agent: ", log.LstdFlags)
+	if *logPath != "" {
+		f, err := os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			logger.Fatalf("open log %q: %v", *logPath, err)
+		}
+		logger = log.New(f, "clawk-pty-agent: ", log.LstdFlags)
+	}
+
+	listener, err := listenVSock(uint32(*port))
+	if err != nil {
+		logger.Fatalf("listen: %v", err)
+	}
+	logger.Printf("listening on AF_VSOCK port=%d cid=ANY", *port)
+
+	// SSH-agent forwarder: binds a Unix socket and on each accept
+	// dials vsock(VMADDR_CID_HOST, sshAgentVSockPort) so the host's
+	// $SSH_AUTH_SOCK is reachable from inside the guest. Runs
+	// alongside the PTY accept loop in its own goroutine; failures
+	// are logged but don't take the agent down.
+	go runSSHAgentForwarder(logger)
+
+	// Memory reporter: serves a small memory snapshot on vsock port
+	// memReportVSockPort. The host's balloon controller dials it
+	// periodically to decide whether to grow or shrink the guest's
+	// balloon. Best-effort: a failure here just means the host falls
+	// back to giving the guest its full ceiling.
+	go runMemReporter(logger)
+
+	var wg sync.WaitGroup
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				break
+			}
+			logger.Printf("accept: %v", err)
+			continue
+		}
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer wg.Done()
+			(&session{
+				conn: c,
+				log:  log.New(logger.Writer(), fmt.Sprintf("clawk-pty-agent[%s]: ", connTag(c)), log.LstdFlags),
+			}).serve()
+		}(conn)
+	}
+	wg.Wait()
+}
+
+func connTag(_ net.Conn) string {
+	return strconv.FormatInt(time.Now().UnixNano()%1_000_000, 36)
+}
+
+// SSH-agent forwarder constants.
+const (
+	// guestSSHAgentSocket is the path the in-VM agent binds, and the
+	// path SSH_AUTH_SOCK in spawned children points at. /run is
+	// world-readable (mode 0755); we chmod the socket itself 0666 so
+	// any guest user can connect through it.
+	guestSSHAgentSocket = "/run/clawk-ssh-agent.sock"
+
+	// sshAgentVSockPort is the host-side vsock port the host's
+	// ssh-agent proxy listens on. Mirrors the constant in
+	// internal/cli/sshagent_proxy_darwin.go (SSHAgentVSockPort).
+	sshAgentVSockPort = 1026
+
+	// vsockHostCID is the well-known vsock CID for the host
+	// (VMADDR_CID_HOST). The guest dials (vsockHostCID, port) to
+	// reach a host-side vsock listener.
+	vsockHostCID = 2
+)
+
+// runSSHAgentForwarder binds /run/clawk-ssh-agent.sock and proxies
+// every connection over vsock to the host's ssh-agent proxy, which
+// in turn relays to the host's $SSH_AUTH_SOCK. Result: ssh-add,
+// git push, etc. inside the guest see the same keys as the host.
+//
+// Idempotent on socket bind: removes any stale file first. The
+// loop exits silently on listener Close (e.g. agent shutdown).
+func runSSHAgentForwarder(logger *log.Logger) {
+	_ = os.Remove(guestSSHAgentSocket)
+	l, err := net.Listen("unix", guestSSHAgentSocket)
+	if err != nil {
+		logger.Printf("ssh-agent-forwarder: bind %s: %v", guestSSHAgentSocket, err)
+		return
+	}
+	if err := os.Chmod(guestSSHAgentSocket, 0o666); err != nil {
+		logger.Printf("ssh-agent-forwarder: chmod %s: %v", guestSSHAgentSocket, err)
+		// Continue anyway — the agent is the only writer.
+	}
+	logger.Printf("ssh-agent-forwarder: listening on %s -> vsock(host:%d)",
+		guestSSHAgentSocket, sshAgentVSockPort)
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logger.Printf("ssh-agent-forwarder: accept: %v", err)
+			return
+		}
+		go forwardSSHAgent(conn, logger)
+	}
+}
+
+func forwardSSHAgent(guest net.Conn, logger *log.Logger) {
+	defer guest.Close()
+	host, err := vsock.Dial(vsockHostCID, sshAgentVSockPort, nil)
+	if err != nil {
+		logger.Printf("ssh-agent-forwarder: vsock dial host:%d: %v",
+			sshAgentVSockPort, err)
+		return
+	}
+	defer host.Close()
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(host, guest); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(guest, host); done <- struct{}{} }()
+	<-done
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Memory reporter
+//
+// The host's balloon controller (machine/vz) has no virtio balloon stats
+// queue on Apple's Virtualization framework, so it can't see guest memory
+// demand on its own. Instead the host dials memReportVSockPort and we write
+// exactly memReportBytes of snapshot, then close. The host's idle watchdog
+// (internal/cli) polls the same snapshot for the activity fields — load and
+// network I/O — to tell a quiescent guest from one still working detached.
+// The wire format is five big-endian uint64s and MUST stay in lock-step
+// with machine/vz/memreport.go (memReport / decodeMemReport):
+//
+//	[0:8]   MemTotal      (KiB)
+//	[8:16]  MemAvailable  (KiB)
+//	[16:24] memory PSI "some avg10" × 100 (0 if PSI unavailable)
+//	[24:32] /proc/loadavg load1 × 100
+//	[32:40] cumulative rx+tx bytes across non-lo interfaces
+//
+// Hosts accept the legacy 24-byte prefix alone, so new fields may only be
+// appended, never reordered.
+// ────────────────────────────────────────────────────────────────────────
+
+const (
+	// memReportVSockPort is the AF_VSOCK port we serve memory snapshots on.
+	// Distinct from the pty agent (1024), time-sync (1025), and ssh-agent
+	// (1026). Keep in sync with machine/vz/memreport.go's agentMemPort.
+	memReportVSockPort = 1027
+
+	// memReportBytes is the fixed snapshot size (5 × uint64).
+	memReportBytes = 40
+)
+
+// runMemReporter listens on memReportVSockPort and writes a fresh memory
+// snapshot on every accept. Exits silently when the listener is closed.
+func runMemReporter(logger *log.Logger) {
+	l, err := vsock.Listen(memReportVSockPort, nil)
+	if err != nil {
+		logger.Printf("mem-reporter: vsock listen %d: %v", memReportVSockPort, err)
+		return
+	}
+	logger.Printf("mem-reporter: listening on AF_VSOCK port=%d", memReportVSockPort)
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logger.Printf("mem-reporter: accept: %v", err)
+			return
+		}
+		serveMemReport(conn, logger)
+	}
+}
+
+// serveMemReport writes one snapshot and closes. The reads are tiny /proc
+// files, so this runs inline rather than in a goroutine.
+func serveMemReport(conn net.Conn, logger *log.Logger) {
+	defer conn.Close()
+	total, avail := readMemInfo()
+	psi := readMemPSICenti()
+
+	var buf [memReportBytes]byte
+	binary.BigEndian.PutUint64(buf[0:8], total)
+	binary.BigEndian.PutUint64(buf[8:16], avail)
+	binary.BigEndian.PutUint64(buf[16:24], psi)
+	binary.BigEndian.PutUint64(buf[24:32], readLoad1Centi())
+	binary.BigEndian.PutUint64(buf[32:40], readNetIOBytes())
+
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(buf[:]); err != nil && !isClosedConn(err) {
+		logger.Printf("mem-reporter: write: %v", err)
+	}
+}
+
+// readMemInfo returns MemTotal and MemAvailable from /proc/meminfo in KiB.
+// Missing fields read as zero; a zero MemTotal tells the host "no usable
+// data", which it treats as absent rather than "guest has no memory".
+func readMemInfo() (total, avail uint64) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "MemTotal":
+			total = parseMeminfoKiB(rest)
+		case "MemAvailable":
+			avail = parseMeminfoKiB(rest)
+		}
+	}
+	return total, avail
+}
+
+// parseMeminfoKiB parses a "   4033244 kB" meminfo value into its KiB number.
+func parseMeminfoKiB(s string) uint64 {
+	s = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), "kB"))
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// readLoad1Centi returns /proc/loadavg's 1-minute average scaled by 100
+// (0.42 -> 42). The host's idle watchdog treats a sustained non-trivial
+// load as "guest still working" even with no session attached — a build
+// or test run left going keeps the VM from being parked. 0 on any error.
+func readLoad1Centi() uint64 {
+	data, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0
+	}
+	f, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0
+	}
+	return uint64(f*100 + 0.5)
+}
+
+// readNetIOBytes returns the cumulative rx+tx byte count across every
+// interface except loopback, from /proc/net/dev. The host's idle watchdog
+// diffs successive samples: moving counters mean traffic is flowing (a
+// forwarded dev server being browsed, a download in progress), so the VM
+// isn't idle. Loopback is excluded because guest-internal chatter says
+// nothing about whether anyone outside still needs the VM. 0 on error.
+func readNetIOBytes() uint64 {
+	data, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return 0
+	}
+	var total uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		name, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(name) == "lo" {
+			continue
+		}
+		fields := strings.Fields(rest)
+		// /proc/net/dev: rx bytes is field 0, tx bytes is field 8.
+		if len(fields) < 9 {
+			continue
+		}
+		rx, _ := strconv.ParseUint(fields[0], 10, 64)
+		tx, _ := strconv.ParseUint(fields[8], 10, 64)
+		total += rx + tx
+	}
+	return total
+}
+
+// readMemPSICenti returns the memory PSI "some avg10" value scaled by 100
+// (e.g. 12.34% -> 1234). Returns 0 when PSI is unavailable — the kernel must
+// be booted with psi=1 (CONFIG_PSI_DEFAULT_DISABLED is set in our kernel).
+func readMemPSICenti() uint64 {
+	data, err := os.ReadFile("/proc/pressure/memory")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "some ") {
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(field, "avg10="); ok {
+				f, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					return 0
+				}
+				return uint64(f*100 + 0.5)
+			}
+		}
+	}
+	return 0
+}

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Required by Apple's Virtualization.framework. Without this entitlement
+    every VZVirtualMachine call returns an authorization error at runtime.
+    Ad-hoc signing (codesign -s - ...) is sufficient for local use; a real
+    Dev ID or Apple-issued certificate would only matter for distribution
+    outside the developer's own machine.
+  -->
+  <key>com.apple.security.virtualization</key>
+  <true/>
+
+  <!--
+    Server/client network entitlements. Virtualization.framework itself
+    doesn't require these, but our gvproxy in-process network stack binds
+    and dials sockets; unsigned binaries under App Sandbox would be
+    blocked. Included here defensively so the same entitlements file
+    works whether or not the binary ever ends up sandboxed.
+  -->
+  <key>com.apple.security.network.server</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
+  <true/>
+
+  <!--
+    Microphone access for guests that opt into virtio-snd audio input
+    (CLAWK_AUDIO_INPUT=1). Without this entitlement Apple's
+    VZVirtioSoundDeviceHostInputStreamConfiguration silently records zeros
+    even after the user grants mic access in System Settings.
+  -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>

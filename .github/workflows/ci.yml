@@ -1,0 +1,67 @@
+# Build, vet, format-check and test both Go modules.
+#
+# Linux exercises the firecracker provider's code (and all the
+# platform-independent logic); macOS exercises the vz provider, which is
+# cgo + Apple Virtualization.framework and only compiles on Darwin. Neither
+# job boots a real VM — the end-to-end boot tests are gated behind
+# TEST_GUEST_BOOT (see internal/e2e) and need /dev/kvm.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './third_party/*'))
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: root module — build / vet / test
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: machine module — build / vet / test
+        working-directory: machine
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+  macos:
+    runs-on: macos-14 # Apple Silicon — required for the vz provider
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # make build codesigns the binary ad-hoc with the entitlements
+      # Virtualization.framework requires.
+      - name: root module — build (vz) / vet / test
+        run: |
+          make build
+          go vet ./...
+          go test ./...
+
+      - name: machine module — vet / test
+        working-directory: machine
+        run: |
+          go vet ./...
+          go test ./...

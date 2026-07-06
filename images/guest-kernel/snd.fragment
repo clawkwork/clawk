@@ -1,0 +1,13 @@
+# Sound support for clawk guest voice dictation.
+#
+# Layered on top of Kata Containers' known-good kernel config (see build.sh):
+# the stock Kata kernel omits sound entirely, so the host's virtio-snd mic
+# device (CLAWK_AUDIO_INPUT, on by default — see machine/vz/vz_darwin.go)
+# attaches but no ALSA capture device is created, and SoX in the guest finds
+# no microphone. These four options give the guest a virtio-snd-backed ALSA
+# card so `/voice` can record. Built in (=y), not modules: the clawk guest
+# kernel is monolithic with no /lib/modules to modprobe from.
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_PCM=y
+CONFIG_SND_VIRTIO=y

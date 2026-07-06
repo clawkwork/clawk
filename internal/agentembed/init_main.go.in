@@ -1,0 +1,756 @@
+// clawk-init is PID 1 inside OCI-image sandboxes. Docker images ship no
+// init system (and usually no systemd, sshd, or cloud-init), so this
+// binary — injected into the rootfs at disk-build time — performs the
+// minimal boot a clawk sandbox needs:
+//
+//  1. mount the pseudo filesystems (/proc, /sys, /dev, /run, ...)
+//  2. read the manifest from the config disk (raw JSON on /dev/vdb)
+//  3. set the hostname, bring up static networking (gvproxy's subnet)
+//  4. create the agent user by editing /etc/passwd & friends directly
+//  5. mount the virtio-fs shares and write the declared files
+//  6. start and supervise the clawk services (pty-agent, time-sync)
+//  7. reap orphans forever, like an init must
+//
+// It deliberately does NOT exec the image's /sbin/init: clawk sandboxes
+// are agent workspaces, not general-purpose machines, and the agent +
+// shares are the entire contract.
+//
+// Like main.go.in (the pty-agent), this file is a standalone module —
+// the host writes it to a scratch dir and cross-compiles it with
+// CGO_ENABLED=0; see internal/guestbuild. The manifest schema is kept in
+// lock-step with internal/guestcfg/manifest.go.
+
+//go:build linux
+
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+)
+
+// ────────────────────────────────────────────────────────────────────────
+// Manifest — lock-step with internal/guestcfg/manifest.go.
+// ────────────────────────────────────────────────────────────────────────
+
+type manifest struct {
+	Version  int           `json:"version"`
+	Hostname string        `json:"hostname,omitempty"`
+	Network  *manifestNet  `json:"network,omitempty"`
+	User     *manifestUser `json:"user,omitempty"`
+	Mounts   []mountSpec   `json:"mounts,omitempty"`
+	Files    []fileSpec    `json:"files,omitempty"`
+	Services []serviceSpec `json:"services,omitempty"`
+}
+
+type manifestNet struct {
+	Interface string   `json:"interface"`
+	Address   string   `json:"address"` // CIDR, e.g. "192.168.127.2/24"
+	Gateway   string   `json:"gateway"`
+	DNS       []string `json:"dns,omitempty"`
+	MTU       int      `json:"mtu,omitempty"`
+}
+
+type manifestUser struct {
+	Name   string   `json:"name"`
+	UID    int      `json:"uid"`
+	GID    int      `json:"gid"`
+	Groups []string `json:"groups,omitempty"`
+	Shell  string   `json:"shell,omitempty"`
+}
+
+type mountSpec struct {
+	Tag      string `json:"tag"`
+	Path     string `json:"path"`
+	ReadOnly bool   `json:"ro,omitempty"`
+}
+
+type fileSpec struct {
+	Path    string `json:"path"`
+	Mode    uint32 `json:"mode"`
+	Owner   string `json:"owner,omitempty"` // "user" → manifest user; default root
+	Content []byte `json:"content"`
+}
+
+type serviceSpec struct {
+	Name string   `json:"name"`
+	Path string   `json:"path"`
+	Args []string `json:"args,omitempty"`
+}
+
+const manifestVersion = 1
+
+// defaultConfigDevice is where the host attaches the manifest disk; a
+// clawk.cfg=<dev> kernel parameter overrides it.
+const defaultConfigDevice = "/dev/vdb"
+
+func main() {
+	// Everything we print goes to the kernel console (the kernel opens
+	// /dev/console as fds 0-2 for init), which the host captures in
+	// console.log — boot problems are diagnosable post-mortem.
+	logf("starting (pid=%d)", os.Getpid())
+	if os.Getpid() != 1 {
+		fatalf("must run as PID 1 (booted via init=)")
+	}
+
+	mountPseudo()
+
+	m, err := loadManifest()
+	if err != nil {
+		fatalf("loading manifest: %v", err)
+	}
+
+	if m.Hostname != "" {
+		if err := unix.Sethostname([]byte(m.Hostname)); err != nil {
+			logf("sethostname: %v", err)
+		}
+		_ = os.WriteFile("/etc/hostname", []byte(m.Hostname+"\n"), 0o644)
+	}
+
+	if m.Network != nil {
+		if err := setupNetwork(m); err != nil {
+			logf("network: %v", err)
+		}
+	}
+
+	if m.User != nil {
+		if err := ensureUser(m.User); err != nil {
+			logf("user setup: %v", err)
+		}
+	}
+
+	for _, mt := range m.Mounts {
+		if err := mountShare(mt, m.User); err != nil {
+			logf("mount %s -> %s: %v", mt.Tag, mt.Path, err)
+		}
+	}
+
+	for _, f := range m.Files {
+		if err := writeFileSpec(f, m.User); err != nil {
+			logf("file %s: %v", f.Path, err)
+		}
+	}
+
+	r := newReaper()
+	for _, svc := range m.Services {
+		go supervise(svc, r)
+	}
+	logf("ready")
+
+	// PID 1 duties until poweroff: reap orphans, honor SIGTERM.
+	r.run()
+}
+
+func logf(format string, args ...any) {
+	fmt.Printf("clawk-init: "+format+"\n", args...)
+}
+
+// fatalf reports the error and halts without exiting: if PID 1 exits the
+// kernel panics, which buries the message under a panic splat. Sleeping
+// keeps the console readable and the VM inspectable until the host kills it.
+func fatalf(format string, args ...any) {
+	logf("FATAL: "+format, args...)
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Pseudo filesystems
+// ────────────────────────────────────────────────────────────────────────
+
+func mountPseudo() {
+	type m struct {
+		source, target, fstype string
+		flags                  uintptr
+		data                   string
+		dirMode                os.FileMode
+	}
+	mounts := []m{
+		{"proc", "/proc", "proc", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC, "", 0o555},
+		{"sysfs", "/sys", "sysfs", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC, "", 0o555},
+		{"devtmpfs", "/dev", "devtmpfs", unix.MS_NOSUID, "mode=0755", 0o755},
+		{"devpts", "/dev/pts", "devpts", unix.MS_NOSUID | unix.MS_NOEXEC, "gid=5,mode=620,ptmxmode=666", 0o755},
+		{"tmpfs", "/dev/shm", "tmpfs", unix.MS_NOSUID | unix.MS_NODEV, "mode=1777", 0o1777},
+		{"tmpfs", "/run", "tmpfs", unix.MS_NOSUID | unix.MS_NODEV, "mode=0755", 0o755},
+		{"tmpfs", "/tmp", "tmpfs", unix.MS_NOSUID | unix.MS_NODEV, "mode=1777", 0o1777},
+		{"cgroup2", "/sys/fs/cgroup", "cgroup2", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC, "", 0o555},
+	}
+	for _, mm := range mounts {
+		if err := os.MkdirAll(mm.target, mm.dirMode); err != nil {
+			logf("mkdir %s: %v", mm.target, err)
+			continue
+		}
+		err := unix.Mount(mm.source, mm.target, mm.fstype, mm.flags, mm.data)
+		// EBUSY: already mounted (e.g. CONFIG_DEVTMPFS_MOUNT pre-mounted
+		// /dev). Not an error.
+		if err != nil && !errors.Is(err, unix.EBUSY) {
+			logf("mount %s on %s: %v", mm.fstype, mm.target, err)
+		}
+	}
+
+	// Standard /dev symlinks that udev/init normally provide. devtmpfs
+	// supplies the device nodes but not these, and their absence breaks
+	// shell process substitution (`<(...)`, which opens /dev/fd/N) and
+	// any tool that reads /dev/stdin etc. Point them at /proc/self/fd
+	// (proc is mounted above). Best-effort; tolerate pre-existing links.
+	for _, ln := range []struct{ target, link string }{
+		{"/proc/self/fd", "/dev/fd"},
+		{"/proc/self/fd/0", "/dev/stdin"},
+		{"/proc/self/fd/1", "/dev/stdout"},
+		{"/proc/self/fd/2", "/dev/stderr"},
+	} {
+		if err := os.Symlink(ln.target, ln.link); err != nil && !errors.Is(err, os.ErrExist) {
+			logf("symlink %s -> %s: %v", ln.link, ln.target, err)
+		}
+	}
+
+	// /dev/kvm: devtmpfs creates it root:root 0600 and there's no udev in
+	// the guest to apply the conventional root:kvm 0660. It only exists
+	// when the guest kernel has KVM (a nested-virt sandbox), so when it's
+	// present make it usable by the non-root sandbox user — otherwise
+	// Docker/KVM and firecracker inside the sandbox need sudo to open it.
+	if _, err := os.Stat("/dev/kvm"); err == nil {
+		if err := os.Chmod("/dev/kvm", 0o666); err != nil {
+			logf("chmod /dev/kvm: %v", err)
+		}
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Manifest loading
+// ────────────────────────────────────────────────────────────────────────
+
+// loadManifest reads the manifest JSON straight off the config block
+// device. The device is a raw JSON document (no filesystem); the decoder
+// stops at the end of the top-level value, so device padding is ignored.
+func loadManifest() (*manifest, error) {
+	dev := defaultConfigDevice
+	if v := cmdlineValue("clawk.cfg"); v != "" {
+		dev = v
+	}
+	f, err := waitForDevice(dev, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var m manifest
+	if err := json.NewDecoder(f).Decode(&m); err != nil {
+		return nil, fmt.Errorf("decoding %s: %w", dev, err)
+	}
+	if m.Version != manifestVersion {
+		return nil, fmt.Errorf(
+			"boot manifest is version %d but this sandbox's clawk-init supports %d — the sandbox disk was created by a different clawk release; recreate it with 'clawk destroy && clawk'",
+			m.Version, manifestVersion)
+	}
+	logf("manifest loaded from %s (%d mounts, %d files, %d services)",
+		dev, len(m.Mounts), len(m.Files), len(m.Services))
+	return &m, nil
+}
+
+// waitForDevice opens dev, retrying briefly — virtio-blk probing can race
+// the first userspace instructions on a fast direct-kernel boot.
+func waitForDevice(dev string, timeout time.Duration) (*os.File, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		f, err := os.Open(dev)
+		if err == nil {
+			return f, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("opening %s: %w", dev, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func cmdlineValue(key string) string {
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return ""
+	}
+	for _, f := range strings.Fields(string(data)) {
+		if v, ok := strings.CutPrefix(f, key+"="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Networking — static configuration; gvproxy hands out a fixed lease so
+// there is nothing to negotiate and no DHCP client to depend on.
+// ────────────────────────────────────────────────────────────────────────
+
+func setupNetwork(m *manifest) error {
+	cfg := m.Network
+
+	if lo, err := netlink.LinkByName("lo"); err == nil {
+		_ = netlink.LinkSetUp(lo)
+	}
+
+	link, err := netlink.LinkByName(cfg.Interface)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", cfg.Interface, err)
+	}
+	addr, err := netlink.ParseAddr(cfg.Address)
+	if err != nil {
+		return fmt.Errorf("parsing address %q: %w", cfg.Address, err)
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("adding address: %w", err)
+	}
+	if cfg.MTU > 0 {
+		if err := netlink.LinkSetMTU(link, cfg.MTU); err != nil {
+			logf("set mtu %d: %v", cfg.MTU, err)
+		}
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("link up: %w", err)
+	}
+
+	gw := net.ParseIP(cfg.Gateway)
+	if gw == nil {
+		return fmt.Errorf("invalid gateway %q", cfg.Gateway)
+	}
+	route := &netlink.Route{LinkIndex: link.Attrs().Index, Gw: gw}
+	if err := netlink.RouteAdd(route); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("default route via %s: %w", gw, err)
+	}
+
+	if len(cfg.DNS) > 0 {
+		var b strings.Builder
+		for _, ns := range cfg.DNS {
+			fmt.Fprintf(&b, "nameserver %s\n", ns)
+		}
+		// Some images symlink /etc/resolv.conf into /run (systemd-resolved
+		// style); remove whatever is there and write a plain file.
+		_ = os.Remove("/etc/resolv.conf")
+		if err := os.WriteFile("/etc/resolv.conf", []byte(b.String()), 0o644); err != nil {
+			logf("resolv.conf: %v", err)
+		}
+	}
+
+	if m.Hostname != "" {
+		appendHostsEntry(m.Hostname)
+	}
+	logf("network up: %s on %s via %s", cfg.Address, cfg.Interface, cfg.Gateway)
+	return nil
+}
+
+// appendHostsEntry maps the hostname to loopback so sudo and friends
+// don't stall on reverse resolution.
+func appendHostsEntry(hostname string) {
+	data, _ := os.ReadFile("/etc/hosts")
+	if strings.Contains(string(data), hostname) {
+		return
+	}
+	f, err := os.OpenFile("/etc/hosts", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "127.0.1.1 %s\n", hostname)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// User creation — direct /etc/passwd surgery, the same approach Apple's
+// container machine uses. useradd/adduser may not exist in the image.
+// ────────────────────────────────────────────────────────────────────────
+
+func ensureUser(u *manifestUser) error {
+	if cur, ok := lookupPasswd(u.Name); ok {
+		if cur.uid == u.UID && cur.gid == u.GID {
+			logf("user %s already present", u.Name)
+			return nil
+		}
+		// Images like docker/sandbox-templates bake the user at uid
+		// 1000; the manifest mirrors the host uid so virtio-fs
+		// ownership lines up. Rewrite rather than recreate, keeping
+		// the image's home content and shell.
+		return reconcileUser(u, cur)
+	}
+
+	shell := u.Shell
+	if shell == "" {
+		shell = "/bin/sh"
+		if _, err := os.Stat("/bin/bash"); err == nil {
+			shell = "/bin/bash"
+		}
+	}
+	home := "/home/" + u.Name
+
+	if err := appendLine("/etc/passwd",
+		fmt.Sprintf("%s:x:%d:%d:clawk agent:%s:%s", u.Name, u.UID, u.GID, home, shell)); err != nil {
+		return err
+	}
+	// The host gid often collides with one the image already defines
+	// (macOS staff=20 vs debian dialout=20). Reuse the existing group —
+	// a second line with the same gid is invalid and confuses id(1).
+	if !gidExists(u.GID) {
+		if err := appendLine("/etc/group",
+			fmt.Sprintf("%s:x:%d:", u.Name, u.GID)); err != nil {
+			return err
+		}
+	}
+	// Locked password; only relevant if the image has shadow auth at all.
+	if _, err := os.Stat("/etc/shadow"); err == nil {
+		if err := appendLine("/etc/shadow", u.Name+":!::0:99999:7:::"); err != nil {
+			logf("shadow: %v", err)
+		}
+	}
+	for _, g := range u.Groups {
+		if err := addUserToGroup(u.Name, g); err != nil {
+			logf("group %s: %v", g, err)
+		}
+	}
+
+	if err := seedHome(home, u.UID, u.GID); err != nil {
+		logf("home: %v", err)
+	}
+
+	// Passwordless sudo when the image ships sudo; harmless otherwise.
+	if st, err := os.Stat("/etc/sudoers.d"); err == nil && st.IsDir() {
+		line := fmt.Sprintf("%s ALL=(ALL) NOPASSWD:ALL\n", u.Name)
+		if err := os.WriteFile("/etc/sudoers.d/90-clawk", []byte(line), 0o440); err != nil {
+			logf("sudoers: %v", err)
+		}
+	}
+	logf("created user %s (uid=%d gid=%d shell=%s)", u.Name, u.UID, u.GID, shell)
+	return nil
+}
+
+type passwdEntry struct {
+	uid, gid    int
+	home, shell string
+}
+
+// lookupPasswd returns name's /etc/passwd entry, if any.
+func lookupPasswd(name string) (passwdEntry, bool) {
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return passwdEntry{}, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 7 && fields[0] == name {
+			uid, err1 := strconv.Atoi(fields[2])
+			gid, err2 := strconv.Atoi(fields[3])
+			if err1 != nil || err2 != nil {
+				return passwdEntry{}, false
+			}
+			return passwdEntry{uid: uid, gid: gid, home: fields[5], shell: fields[6]}, true
+		}
+	}
+	return passwdEntry{}, false
+}
+
+// reconcileUser rewrites an image-baked user's uid/gid to the manifest's
+// (host-mirroring) values and re-owns its home tree, so files the image
+// shipped under /home/<name> stay usable after the uid change.
+func reconcileUser(u *manifestUser, cur passwdEntry) error {
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 7 && fields[0] == u.Name {
+			fields[2] = strconv.Itoa(u.UID)
+			fields[3] = strconv.Itoa(u.GID)
+			lines[i] = strings.Join(fields, ":")
+		}
+	}
+	if err := os.WriteFile("/etc/passwd", []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		return err
+	}
+	// Move the user's own group to the new gid too — unless the gid is
+	// already taken (host gid 20 vs debian dialout), in which case the
+	// existing group serves as the primary group.
+	if !gidExists(u.GID) {
+		gdata, err := os.ReadFile("/etc/group")
+		if err == nil {
+			glines := strings.Split(string(gdata), "\n")
+			for i, line := range glines {
+				fields := strings.Split(line, ":")
+				if len(fields) >= 3 && fields[0] == u.Name &&
+					fields[2] == strconv.Itoa(cur.gid) {
+					fields[2] = strconv.Itoa(u.GID)
+					glines[i] = strings.Join(fields, ":")
+				}
+			}
+			_ = os.WriteFile("/etc/group", []byte(strings.Join(glines, "\n")), 0o644)
+		}
+	}
+	chownTree(cur.home, u.UID, u.GID)
+	logf("reconciled user %s: uid %d→%d gid %d→%d", u.Name, cur.uid, u.UID, cur.gid, u.GID)
+	return nil
+}
+
+// chownTree re-owns path and everything under it, best-effort. Only the
+// local filesystem is touched — virtio-fs shares aren't mounted yet when
+// user setup runs.
+func chownTree(path string, uid, gid int) {
+	if path == "" || path == "/" {
+		return
+	}
+	_ = filepath.WalkDir(path, func(p string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		_ = os.Lchown(p, uid, gid)
+		return nil
+	})
+}
+
+func gidExists(gid int) bool {
+	data, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return false
+	}
+	want := ":" + strconv.Itoa(gid) + ":"
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.SplitN(line, ":", 4)
+		if len(fields) >= 3 && ":"+fields[2]+":" == want {
+			return true
+		}
+	}
+	return false
+}
+
+func appendLine(path, line string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Guard against a file with no trailing newline — appending straight
+	// after the last entry would corrupt both lines.
+	if st, err := f.Stat(); err == nil && st.Size() > 0 {
+		var last [1]byte
+		if _, err := f.ReadAt(last[:], st.Size()-1); err == nil && last[0] != '\n' {
+			if _, err := f.WriteString("\n"); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = f.WriteString(line + "\n")
+	return err
+}
+
+// addUserToGroup appends name to an existing group's member list. Missing
+// groups are skipped — e.g. "kvm" on an image without udev conventions.
+func addUserToGroup(name, group string) error {
+	data, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		if !strings.HasPrefix(line, group+":") {
+			continue
+		}
+		found = true
+		if strings.HasSuffix(line, ":") {
+			lines[i] = line + name
+		} else {
+			lines[i] = line + "," + name
+		}
+	}
+	if !found {
+		return nil
+	}
+	return os.WriteFile("/etc/group", []byte(strings.Join(lines, "\n")), 0o644)
+}
+
+func seedHome(home string, uid, gid int) error {
+	if _, err := os.Stat(home); err == nil {
+		return os.Chown(home, uid, gid)
+	}
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return err
+	}
+	// Copy /etc/skel if the image has one (regular files only; that's all
+	// skel ever contains in practice).
+	if entries, err := os.ReadDir("/etc/skel"); err == nil {
+		for _, e := range entries {
+			if !e.Type().IsRegular() {
+				continue
+			}
+			src := filepath.Join("/etc/skel", e.Name())
+			dst := filepath.Join(home, e.Name())
+			if data, err := os.ReadFile(src); err == nil {
+				_ = os.WriteFile(dst, data, 0o644)
+				_ = os.Chown(dst, uid, gid)
+			}
+		}
+	}
+	return os.Chown(home, uid, gid)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Shares and files
+// ────────────────────────────────────────────────────────────────────────
+
+// mountShare mounts one virtio-fs tag. Intermediate directories that
+// mkdir creates under the user's home are chowned to the user —
+// otherwise ~/.claude etc. end up root-owned and unwritable.
+func mountShare(mt mountSpec, u *manifestUser) error {
+	if err := os.MkdirAll(mt.Path, 0o755); err != nil {
+		return err
+	}
+	if u != nil {
+		chownAncestorsUnder(mt.Path, "/home/"+u.Name, u.UID, u.GID)
+	}
+	var flags uintptr
+	if mt.ReadOnly {
+		flags |= unix.MS_RDONLY
+	}
+	if err := unix.Mount(mt.Tag, mt.Path, "virtiofs", flags, ""); err != nil {
+		return err
+	}
+	logf("mounted %s on %s", mt.Tag, mt.Path)
+	return nil
+}
+
+// chownAncestorsUnder chowns every directory strictly below root down to
+// path (inclusive) — only those that exist on the local filesystem.
+func chownAncestorsUnder(path, root string, uid, gid int) {
+	if !strings.HasPrefix(path, root+"/") {
+		return
+	}
+	for p := path; p != root && p != "/" && p != "."; p = filepath.Dir(p) {
+		_ = os.Chown(p, uid, gid)
+	}
+}
+
+func writeFileSpec(f fileSpec, u *manifestUser) error {
+	if err := os.MkdirAll(filepath.Dir(f.Path), 0o755); err != nil {
+		return err
+	}
+	mode := os.FileMode(f.Mode)
+	if mode == 0 {
+		mode = 0o644
+	}
+	if err := os.WriteFile(f.Path, f.Content, mode); err != nil {
+		return err
+	}
+	// WriteFile only applies mode on create; enforce on overwrite too.
+	if err := os.Chmod(f.Path, mode); err != nil {
+		return err
+	}
+	if f.Owner == "user" && u != nil {
+		if err := os.Chown(f.Path, u.UID, u.GID); err != nil {
+			return err
+		}
+		chownAncestorsUnder(filepath.Dir(f.Path), "/home/"+u.Name, u.UID, u.GID)
+	}
+	return nil
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Service supervision + orphan reaping
+//
+// PID 1 owns wait(2) for every orphan in the system, so exec.Cmd.Wait
+// can't be used — the global reaper would steal its child. Instead the
+// reaper multiplexes exits back to whichever supervisor registered the pid.
+// ────────────────────────────────────────────────────────────────────────
+
+type reaper struct {
+	mu      sync.Mutex
+	waiters map[int]chan int // pid → exit status
+}
+
+func newReaper() *reaper {
+	return &reaper{waiters: map[int]chan int{}}
+}
+
+// run loops forever reaping children and handling shutdown signals. This
+// is the init's main loop; it never returns.
+func (r *reaper) run() {
+	sigs := make(chan os.Signal, 16)
+	signal.Notify(sigs, unix.SIGCHLD, unix.SIGTERM, unix.SIGINT)
+	for sig := range sigs {
+		switch sig {
+		case unix.SIGTERM, unix.SIGINT:
+			logf("caught %s; powering off", sig)
+			_ = unix.Kill(-1, unix.SIGTERM)
+			time.Sleep(time.Second)
+			unix.Sync()
+			_ = unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
+		case unix.SIGCHLD:
+			r.reapAll()
+		}
+	}
+}
+
+func (r *reaper) reapAll() {
+	for {
+		var ws unix.WaitStatus
+		pid, err := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
+		if pid <= 0 || err != nil {
+			return
+		}
+		r.mu.Lock()
+		ch, ok := r.waiters[pid]
+		delete(r.waiters, pid)
+		r.mu.Unlock()
+		if ok {
+			ch <- ws.ExitStatus()
+		}
+	}
+}
+
+// supervise starts svc and restarts it whenever it exits, with a fixed
+// backoff. Service stdout/stderr inherit the console so failures are
+// visible in the host's console.log.
+func supervise(svc serviceSpec, r *reaper) {
+	for {
+		cmd := exec.Command(svc.Path, svc.Args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		// PID 1 starts with an empty environment; give services at
+		// least a standard PATH so their own exec calls can resolve
+		// bare command names.
+		cmd.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+		// Register interest BEFORE the child can exit: start it stopped?
+		// Not needed — SIGCHLD handling is level-triggered via reapAll,
+		// but the pid→chan registration must happen before reapAll could
+		// observe the exit. Holding the lock across Start closes the race.
+		r.mu.Lock()
+		if err := cmd.Start(); err != nil {
+			r.mu.Unlock()
+			logf("service %s: start: %v", svc.Name, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		pid := cmd.Process.Pid
+		ch := make(chan int, 1)
+		r.waiters[pid] = ch
+		r.mu.Unlock()
+
+		logf("service %s started (pid=%d)", svc.Name, pid)
+		status := <-ch
+		// Release the os/exec bookkeeping without letting it wait(2):
+		// the reaper already collected the child.
+		_ = cmd.Process.Release()
+		logf("service %s exited (status=%d); restarting in 1s", svc.Name, status)
+		time.Sleep(time.Second)
+	}
+}
