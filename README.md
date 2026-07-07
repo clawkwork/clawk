@@ -87,15 +87,11 @@ macOS-first.)
 brew install clawkwork/tap/clawk
 ```
 
-Homebrew downloads the release binary and ad-hoc-codesigns it locally with
-the entitlements Virtualization.framework requires (see `clawk.entitlements`)
-— no Apple Developer ID needed.
-
 **From source** (contributors, or if you don't use Homebrew) — needs Go 1.26+:
 
 ```sh
 git clone https://github.com/clawkwork/clawk && cd clawk
-make install      # builds, codesigns, drops the binary in $GOBIN
+make install
 ```
 
 Either way there's no extra host tooling — no Docker, no qemu, no sudo. The
