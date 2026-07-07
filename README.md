@@ -78,27 +78,34 @@ repo, and `--resume` restores the conversation.
 
 ## Install
 
-Requires macOS 14+ on Apple silicon. There are no release binaries yet, so
-you also need Go 1.26+ to build. (Linux is supported via firecracker and
+Requires macOS 14+ on Apple silicon. (Linux is supported via firecracker and
 currently experimental — see
 [VM providers](docs/commands.md#vm-providers) for the gaps; this README is
 macOS-first.)
+
+```sh
+brew install clawkwork/tap/clawk
+```
+
+Homebrew downloads the release binary and ad-hoc-codesigns it locally with
+the entitlements Virtualization.framework requires (see `clawk.entitlements`)
+— no Apple Developer ID needed.
+
+**From source** (contributors, or if you don't use Homebrew) — needs Go 1.26+:
 
 ```sh
 git clone https://github.com/clawkwork/clawk && cd clawk
 make install      # builds, codesigns, drops the binary in $GOBIN
 ```
 
-No extra host tooling — no Docker, no qemu, no sudo. The hypervisor is
-Apple's Virtualization.framework, linked into the binary; `make install`
-ad-hoc-codesigns it with the entitlements Virtualization.framework requires
-(see `clawk.entitlements`). First run probes for anything missing and offers
-to fix it.
+Either way there's no extra host tooling — no Docker, no qemu, no sudo. The
+hypervisor is Apple's Virtualization.framework, linked into the binary. First
+run probes for anything missing and offers to fix it.
 
-**Uninstall:** `clawk destroy` your sandboxes, `rm -rf ~/.clawk`, and delete
-the binary from `$GOBIN`. Nothing else was installed — there are no launchd
-jobs; the per-sandbox daemons are ordinary processes that exit with their
-VMs.
+**Uninstall:** `clawk destroy` your sandboxes, `rm -rf ~/.clawk`, then remove
+the binary — `brew uninstall clawk` (or delete it from `$GOBIN` for a
+source install). Nothing else was installed — there are no launchd jobs; the
+per-sandbox daemons are ordinary processes that exit with their VMs.
 
 ## Quickstart
 
