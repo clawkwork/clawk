@@ -2,7 +2,6 @@ package cli
 
 import (
 	"os"
-	"path/filepath"
 
 	"github.com/clawkwork/clawk/internal/config"
 	"github.com/clawkwork/clawk/internal/sandbox"
@@ -57,7 +56,7 @@ func collectSandboxShares(sb *config.Sandbox) []machine.Share {
 		if p.InPlace {
 			out = append(out, machine.Share{
 				HostPath: p.Worktree,
-				Tag:      filepath.Base(p.Worktree),
+				Tag:      sandbox.InPlaceWorktreeTag(p.Worktree),
 			})
 			continue
 		}
@@ -65,7 +64,7 @@ func collectSandboxShares(sb *config.Sandbox) []machine.Share {
 			seenRepos[p.Repo] = true
 			out = append(out, machine.Share{
 				HostPath: p.Repo,
-				Tag:      "src_" + filepath.Base(p.Repo),
+				Tag:      sandbox.RepoShareTag(p.Repo),
 			})
 		}
 	}

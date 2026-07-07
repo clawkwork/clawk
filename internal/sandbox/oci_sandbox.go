@@ -133,9 +133,11 @@ func OCIGuestManifest(sb *config.Sandbox, stateDir, cacheDir, rootDir string) (g
 			continue
 		}
 		if p.InPlace {
-			wtTag := filepath.Base(p.Worktree)
+			// Tag is bounded to the virtio-fs limit; the guest mount
+			// point keeps the readable basename.
+			wtBase := filepath.Base(p.Worktree)
 			m.Mounts = append(m.Mounts, guestcfg.Mount{
-				Tag: wtTag, Path: WorkspaceRoot + "/" + wtTag,
+				Tag: InPlaceWorktreeTag(p.Worktree), Path: WorkspaceRoot + "/" + wtBase,
 			})
 			continue
 		}
@@ -144,7 +146,7 @@ func OCIGuestManifest(sb *config.Sandbox, stateDir, cacheDir, rootDir string) (g
 		}
 		seenRepos[p.Repo] = true
 		m.Mounts = append(m.Mounts, guestcfg.Mount{
-			Tag: "src_" + filepath.Base(p.Repo), Path: p.Repo,
+			Tag: RepoShareTag(p.Repo), Path: p.Repo,
 		})
 	}
 
