@@ -52,7 +52,28 @@ for opt in CONFIG_SND_VIRTIO CONFIG_SND CONFIG_SOUND; do
 	}
 done
 
-# 5. Build and collect vmlinux.
-make -C "$ksrc" -j"$(nproc)" vmlinux
-cp "$ksrc/vmlinux" "$OUT"
-echo ">> built $OUT"
+# 5. Build the bootable kernel image and collect it into OUT. The format the
+#    bootloaders accept differs by arch, so `make vmlinux` (the ELF from the
+#    build tree) is NOT the right artifact for arm64:
+#      - arm64: Apple's VZLinuxBootLoader (and firecracker-aarch64) boot the raw
+#        `arch/arm64/boot/Image` (the flat image with the ARM\x64 boot header).
+#        Handing them the ELF vmlinux fails at start with VZError Code=1. `make
+#        Image` is `objcopy -O binary -S` of vmlinux — it also drops the ~300MB
+#        of DWARF, so the result is ~15MB, matching Kata's shipped kernel.
+#      - amd64: firecracker/x86 boots an uncompressed ELF vmlinux; strip its
+#        debug info (~300MB) so the asset is the ~15MB loadable image.
+case "$(uname -m)" in
+	aarch64 | arm64)
+		make -C "$ksrc" -j"$(nproc)" Image
+		cp "$ksrc/arch/arm64/boot/Image" "$OUT"
+		;;
+	x86_64 | amd64)
+		make -C "$ksrc" -j"$(nproc)" vmlinux
+		"${STRIP:-strip}" -s -o "$OUT" "$ksrc/vmlinux"
+		;;
+	*)
+		echo "unsupported build arch $(uname -m)" >&2
+		exit 1
+		;;
+esac
+echo ">> built $OUT ($(du -h "$OUT" | cut -f1))"

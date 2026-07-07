@@ -8,6 +8,7 @@ machine/smoke-firecracker
 
 # Local cruft
 .DS_Store
+/vmlinux-arm64-snd
 third_party/misc
 debug-logs/
 *.panic
