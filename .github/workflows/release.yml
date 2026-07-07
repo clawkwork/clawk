@@ -1,0 +1,75 @@
+name: release
+
+# Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
+# Builds the macOS/arm64 binary, publishes it as a GitHub release, and (if
+# HOMEBREW_TAP_TOKEN is set) bumps the Homebrew tap formula to match.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Virtualization.framework is cgo/Objective-C: the binary MUST be built
+    # on macOS arm64 — it cannot be cross-compiled from Linux.
+    runs-on: macos-14
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build clawk (darwin/arm64)
+        run: go build -trimpath -o clawk ./cmd/clawk
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          tarball="clawk-${GITHUB_REF_NAME}-darwin-arm64.tar.gz"
+          tar czf "$tarball" clawk clawk.entitlements LICENSE
+          sha=$(shasum -a 256 "$tarball" | awk '{print $1}')
+          {
+            echo "tarball=$tarball"
+            echo "sha256=$sha"
+            echo "url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${tarball}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### clawk ${GITHUB_REF_NAME}"
+            echo "\`sha256: ${sha}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.tarball }}
+          generate_release_notes: true
+
+      # Rewrites version/url/sha256 in the tap's Formula/clawk.rb and pushes.
+      # Skipped automatically when HOMEBREW_TAP_TOKEN isn't configured — in
+      # that case grab the sha256 from the job summary and bump the formula
+      # by hand.
+      - name: Update Homebrew tap
+        if: env.TAP_TOKEN != ''
+        env:
+          URL: ${{ steps.pkg.outputs.url }}
+          SHA: ${{ steps.pkg.outputs.sha256 }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/clawkwork/homebrew-tap.git" tap
+          cd tap
+          sed -i.bak -E \
+            -e "s|^  version \".*\"|  version \"${v}\"|" \
+            -e "s|^  url \".*\"|  url \"${URL}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" \
+            Formula/clawk.rb
+          rm -f Formula/clawk.rb.bak
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "clawk ${v}"
+          git push
