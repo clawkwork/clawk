@@ -42,10 +42,10 @@ injected (`internal/agentembed`, cross-compiled on the host at build time):
 
 - **clawk-init** — PID 1. Sets up `/dev`, networking, the workspace, and the
   guest user, then starts the services named in its config disk.
-- **pty-agent** — listens on AF_VSOCK 1024, allocates a PTY per session, and
-  speaks the framing in `internal/vsockproto` to the host
+- **clawk-pty-agent** — listens on AF_VSOCK 1024, allocates a PTY per session,
+  and speaks the framing in `internal/vsockproto` to the host
   (`internal/vsockclient`). This is the sole control path into the guest.
-- **time-sync** — corrects guest clock skew after host sleep/wake.
+- **clawk-time-sync** — corrects guest clock skew after host sleep/wake.
 
 ## Networking
 

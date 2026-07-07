@@ -59,6 +59,5 @@ disclosure timeline with you.
 
 ## Supported versions
 
-clawk is pre-1.0; security fixes target the latest `main` (and the most recent
-tagged release once releases exist). Please reproduce against current `main`
-before reporting.
+clawk is pre-1.0; security fixes target the latest `main` and the most recent
+tagged release. Please reproduce against current `main` before reporting.

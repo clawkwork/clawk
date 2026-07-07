@@ -15,7 +15,7 @@ clawk destroy [<name>]                 # remove (host-side state persists)
 
 clawk system info  [--json]            # host prereqs + active components
 clawk system df    [--json]            # disk usage by sandbox / cache
-clawk system prune [--image|--vm]      # reap unreferenced OCI rootfs disks
+clawk system prune [--image]           # reap unreferenced OCI rootfs disks
 
 clawk debug dump   [<name>]            # postmortem bundle (logs + state)
 clawk debug vshell [<name>] [-- cmd]   # raw vsock shell escape hatch
