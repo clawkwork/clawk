@@ -228,6 +228,21 @@ func mountPseudo() {
 			logf("chmod /dev/kvm: %v", err)
 		}
 	}
+
+	// /dev/snd/*: virtio-snd nodes also come up root:root 0600, with no udev
+	// to apply the conventional root:audio 0660. The sandbox user runs SoX as
+	// non-root for /voice dictation, so it can't open the capture PCM — and
+	// alsa-lib's `default` route can't even read controlC0 to resolve the
+	// card, which surfaces as "cannot find card '0'". Open them up when the
+	// card is present (only the sound-enabled guest kernel creates it).
+	if entries, err := os.ReadDir("/dev/snd"); err == nil {
+		for _, e := range entries {
+			p := "/dev/snd/" + e.Name()
+			if err := os.Chmod(p, 0o666); err != nil {
+				logf("chmod %s: %v", p, err)
+			}
+		}
+	}
 }
 
 // ────────────────────────────────────────────────────────────────────────
