@@ -145,12 +145,19 @@ func TestFetchOverrideMissingLocalPath(t *testing.T) {
 	require.Error(t, err, "Fetch with missing override path succeeded")
 }
 
-// TestFetchOverrideURL downloads a raw vmlinux once and serves the cache
-// on the second call (no further requests).
+// TestFetchOverrideURL downloads a raw vmlinux once; the second call
+// revalidates against the origin (conditional GET) and, when the content is
+// unchanged, serves the cache without re-downloading. See TestOverrideRevalidates
+// for the republish/offline cases.
 func TestFetchOverrideURL(t *testing.T) {
-	hits := 0
+	downloads := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		downloads++
+		w.Header().Set("ETag", `"v1"`)
 		_, _ = w.Write([]byte("raw-vmlinux-bytes"))
 	}))
 	defer srv.Close()
@@ -166,5 +173,5 @@ func TestFetchOverrideURL(t *testing.T) {
 	require.Equal(t, got, p, "CachedPath after download path mismatch")
 	_, err = Fetch(context.Background(), opts)
 	require.NoError(t, err, "second Fetch")
-	require.Equal(t, 1, hits, "server hit %d times, want 1 (second fetch should be cached)", hits)
+	require.Equal(t, 1, downloads, "downloaded %d times, want 1 (unchanged fetch should 304, not re-download)", downloads)
 }

@@ -147,13 +147,16 @@ func fetchOverride(ctx context.Context, cacheDir, src string) (string, error) {
 		return src, nil
 	}
 	dst := overridePath(cacheDir, src)
-	if _, err := os.Stat(dst); err == nil {
-		return dst, nil
-	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("kernel: cache dir: %w", err)
 	}
-	if err := downloadRaw(ctx, src, dst); err != nil {
+	// Revalidate against the remote. A bare kernel URL (e.g. a GitHub release
+	// asset) can be *republished* with new bytes at the same URL — as happened
+	// when guest-kernel switched from the ELF vmlinux to the raw Image — so a
+	// cache keyed only on the URL would serve the stale kernel forever, which
+	// boots to a cryptic VZError Code=1. A conditional GET re-downloads only
+	// when the content actually changed, and keeps the cache when offline.
+	if err := revalidateDownload(ctx, src, dst); err != nil {
 		return "", err
 	}
 	return dst, nil
@@ -171,41 +174,84 @@ func overridePath(cacheDir, url string) string {
 		"override-"+hex.EncodeToString(sum[:4]), "vmlinux")
 }
 
-// downloadRaw streams a bare file at url into dst through a temp file so a
-// partial download never looks cached.
-func downloadRaw(ctx context.Context, url, dst string) error {
+// revalidateDownload makes dst hold the current bytes at url. It keys off an
+// ETag/Last-Modified validator saved beside the file (dst+".etag") and issues a
+// conditional GET, so an unchanged asset costs a single 304 with no re-download,
+// while a republished one (new bytes, same URL) is re-fetched. Written through a
+// temp file so a partial download never looks cached. On a network error it
+// keeps any existing cache rather than failing, so a cached kernel still boots
+// offline.
+func revalidateDownload(ctx context.Context, url, dst string) error {
+	etagPath := dst + ".etag"
+	_, statErr := os.Stat(dst)
+	haveCache := statErr == nil
+
+	var validator string
+	if haveCache {
+		if b, err := os.ReadFile(etagPath); err == nil {
+			validator = strings.TrimSpace(string(b))
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("kernel: building request: %w", err)
 	}
+	// Only send a conditional header when we have both the cached bytes and a
+	// validator; a validator without the file (or vice versa) must re-download.
+	if haveCache && validator != "" {
+		req.Header.Set("If-None-Match", validator)
+	}
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		if haveCache {
+			return nil // offline: fall back to the cached kernel
+		}
 		return fmt.Errorf("kernel: downloading %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+
+	switch {
+	case resp.StatusCode == http.StatusNotModified && haveCache:
+		return nil // content unchanged
+	case resp.StatusCode == http.StatusOK:
+		tmp := dst + ".tmp"
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return fmt.Errorf("kernel: creating %s: %w", tmp, err)
+		}
+		_, copyErr := io.Copy(f, resp.Body)
+		closeErr := f.Close()
+		if copyErr != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("kernel: writing %s: %w", tmp, copyErr)
+		}
+		if closeErr != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("kernel: closing %s: %w", tmp, closeErr)
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("kernel: promoting %s: %w", dst, err)
+		}
+		// Save whatever validator the server gave so the next fetch is a cheap
+		// 304. Prefer ETag; fall back to Last-Modified. If neither, drop any
+		// stale validator so we re-download (never falsely 304) next time.
+		if et := resp.Header.Get("ETag"); et != "" {
+			_ = os.WriteFile(etagPath, []byte(et), 0o644)
+		} else if lm := resp.Header.Get("Last-Modified"); lm != "" {
+			_ = os.WriteFile(etagPath, []byte(lm), 0o644)
+		} else {
+			_ = os.Remove(etagPath)
+		}
+		return nil
+	default:
+		if haveCache {
+			return nil // unexpected status, but a cached kernel beats failing
+		}
 		return fmt.Errorf("kernel: downloading %s: HTTP %s", url, resp.Status)
 	}
-	tmp := dst + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return fmt.Errorf("kernel: creating %s: %w", tmp, err)
-	}
-	_, copyErr := io.Copy(f, resp.Body)
-	closeErr := f.Close()
-	if copyErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("kernel: writing %s: %w", tmp, copyErr)
-	}
-	if closeErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("kernel: closing %s: %w", tmp, closeErr)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("kernel: promoting %s: %w", dst, err)
-	}
-	return nil
 }
 
 // download streams the archive at url and extracts member into dst,
