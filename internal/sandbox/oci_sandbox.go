@@ -160,6 +160,10 @@ func OCIGuestManifest(sb *config.Sandbox, stateDir, cacheDir, rootDir string) (g
 	for _, sh := range shares {
 		m.Mounts = append(m.Mounts, guestcfg.Mount{
 			Tag: sh.Tag, Path: sh.GuestPath, ReadOnly: sh.ReadOnly,
+			// Non-zero only for the toolchain caches: a 9p-capable clawk-init
+			// mounts them over 9p (from the host ninep server on this port),
+			// falling back to the Tag'd virtio-fs share otherwise.
+			NinePVSockPort: sh.NinePVSockPort,
 		})
 	}
 

@@ -16,3 +16,20 @@
 # CONFIG_VIRTIO_VSOCKETS). Built in (=y), not a module: the clawk guest kernel
 # is monolithic with no /lib/modules to modprobe from.
 CONFIG_NET_9P_FD=y
+
+# fscache-backed 9p caching. This is NOT what makes exec-from-9p work: the
+# EINVAL we first saw when exec'ing a binary off a 9p mount was a server-side
+# bug — hugelgupf/p9 mapped a missing security.capability xattr (which the
+# kernel probes via Txattrwalk on execve) to EINVAL instead of ENODATA, and the
+# kernel treats EINVAL as fatal. That's fixed in the p9 server (see the
+# clawkwork/p9 replace in go.mod), and go1.26 now exec's straight off the mount.
+#
+# We keep fscache anyway for the write-back page cache it gives cache=loose
+# mounts: it collapses repeated reads of the same toolchain/cache files into
+# local memory instead of a 9p round-trip per page, which is the whole point of
+# moving the caches off virtio-fs. It also provides the netfs-backed mmap path
+# that read-only executable mappings use. (FSCACHE pulls in NETFS_SUPPORT on
+# 6.x; olddefconfig resolves CACHEFILES etc.)
+CONFIG_NETFS_SUPPORT=y
+CONFIG_FSCACHE=y
+CONFIG_9P_FSCACHE=y

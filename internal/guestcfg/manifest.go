@@ -73,11 +73,23 @@ type User struct {
 	Shell  string   `json:"shell,omitempty"`  // empty: /bin/bash if present, else /bin/sh
 }
 
-// Mount is one virtio-fs share to mount.
+// Mount is one share to mount in the guest.
+//
+// Transport: a Mount is virtio-fs by default (keyed on Tag). When
+// NinePVSockPort is non-zero, a 9p-capable clawk-init instead mounts it over
+// 9p2000.L from the host ninep server on that guest vsock port (see
+// internal/ninep) — used for the toolchain caches, whose file counts make
+// Apple's virtio-fs pin enough host fds to exhaust kern.maxfiles and panic the
+// Mac. Tag stays populated as the fallback: an older clawk-init that predates
+// 9p support ignores NinePVSockPort (additive field, lenient JSON) and mounts
+// the virtio-fs share, and a 9p-capable init falls back to it if the 9p mount
+// fails (e.g. a kernel without CONFIG_NET_9P_FD). This keeps the change
+// additive — no Version bump, no forced sandbox recreation.
 type Mount struct {
-	Tag      string `json:"tag"`
-	Path     string `json:"path"`
-	ReadOnly bool   `json:"ro,omitempty"`
+	Tag            string `json:"tag"`
+	Path           string `json:"path"`
+	ReadOnly       bool   `json:"ro,omitempty"`
+	NinePVSockPort uint32 `json:"ninep_port,omitempty"`
 }
 
 // File is one file written into the guest at boot. Content is raw bytes

@@ -76,6 +76,12 @@ type mountSpec struct {
 	Tag      string `json:"tag"`
 	Path     string `json:"path"`
 	ReadOnly bool   `json:"ro,omitempty"`
+	// NinePVSockPort, when non-zero, mounts this share over 9p2000.L from the
+	// host ninep server on that guest vsock port instead of virtio-fs — the
+	// toolchain caches, whose file counts make Apple's virtio-fs exhaust the
+	// host's kern.maxfiles. Tag is still the virtio-fs fallback. Kept in
+	// lock-step with internal/guestcfg.Mount.
+	NinePVSockPort uint32 `json:"ninep_port,omitempty"`
 }
 
 type fileSpec struct {
@@ -623,9 +629,12 @@ func seedHome(home string, uid, gid int) error {
 // Shares and files
 // ────────────────────────────────────────────────────────────────────────
 
-// mountShare mounts one virtio-fs tag. Intermediate directories that
-// mkdir creates under the user's home are chowned to the user —
-// otherwise ~/.claude etc. end up root-owned and unwritable.
+// mountShare mounts one share. Toolchain caches (NinePVSockPort != 0) mount
+// over 9p from the host ninep server; everything else, and any cache whose 9p
+// mount fails (e.g. a kernel without CONFIG_NET_9P_FD), mounts the virtio-fs
+// Tag. Intermediate directories that mkdir creates under the user's home are
+// chowned to the user — otherwise ~/.claude etc. end up root-owned and
+// unwritable.
 func mountShare(mt mountSpec, u *manifestUser) error {
 	if err := os.MkdirAll(mt.Path, 0o755); err != nil {
 		return err
@@ -637,10 +646,42 @@ func mountShare(mt mountSpec, u *manifestUser) error {
 	if mt.ReadOnly {
 		flags |= unix.MS_RDONLY
 	}
+
+	if mt.NinePVSockPort > 0 {
+		if err := mountNineP(mt, flags); err == nil {
+			logf("mounted 9p %s on %s (vsock port %d)", mt.Tag, mt.Path, mt.NinePVSockPort)
+			return nil
+		} else {
+			logf("9p mount %s on %s failed (%v); falling back to virtio-fs", mt.Tag, mt.Path, err)
+		}
+	}
+
 	if err := unix.Mount(mt.Tag, mt.Path, "virtiofs", flags, ""); err != nil {
 		return err
 	}
 	logf("mounted %s on %s", mt.Tag, mt.Path)
+	return nil
+}
+
+// mountNineP mounts mt over 9p2000.L from the host ninep server on
+// mt.NinePVSockPort. It opens an AF_VSOCK stream to the host (CID 2) and hands
+// the socket fd to the 9p "fd" transport. The kernel takes a reference to the
+// socket once the mount succeeds, so on success the fd is intentionally not
+// closed (the mount owns it); on failure it is, to avoid a leak.
+func mountNineP(mt mountSpec, flags uintptr) error {
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return fmt.Errorf("socket(AF_VSOCK): %w", err)
+	}
+	if err := unix.Connect(fd, &unix.SockaddrVM{CID: unix.VMADDR_CID_HOST, Port: mt.NinePVSockPort}); err != nil {
+		unix.Close(fd)
+		return fmt.Errorf("connect vsock port=%d: %w", mt.NinePVSockPort, err)
+	}
+	data := fmt.Sprintf("trans=fd,rfdno=%d,wfdno=%d,version=9p2000.L,msize=524288,cache=loose,access=any", fd, fd)
+	if err := unix.Mount("clawk-9p", mt.Path, "9p", flags, data); err != nil {
+		unix.Close(fd)
+		return fmt.Errorf("mount 9p: %w", err)
+	}
 	return nil
 }
 

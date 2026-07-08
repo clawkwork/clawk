@@ -65,7 +65,7 @@ make -C "$ksrc" olddefconfig
 # 4. Confirm the options survived (olddefconfig silently drops options whose
 #    deps are unmet — catch that here instead of shipping a soundless kernel
 #    or one that can't mount the host-served 9p caches).
-for opt in CONFIG_SND_VIRTIO CONFIG_SND CONFIG_SOUND CONFIG_NET_9P_FD; do
+for opt in CONFIG_SND_VIRTIO CONFIG_SND CONFIG_SOUND CONFIG_NET_9P_FD CONFIG_9P_FSCACHE; do
 	grep -q "^${opt}=y" "$ksrc/.config" || {
 		echo "ERROR: ${opt}=y missing after olddefconfig — dependency unmet" >&2
 		exit 1

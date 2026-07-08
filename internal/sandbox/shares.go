@@ -25,14 +25,23 @@ var workspaceClaudeMDTmpl string
 var workspaceClaudeMD = template.Must(template.New("workspace_claudemd").
 	Parse(workspaceClaudeMDTmpl))
 
-// HostShare is a host directory virtiofs-mounted into every sandbox. Tag
-// must be unique across all shares on one VM (vz uses it as the mount
-// identifier). GuestPath is where the guest mounts the share inside.
+// HostShare is a host directory shared into every sandbox. Tag must be unique
+// across all shares on one VM (vz uses it as the virtio-fs mount identifier).
+// GuestPath is where the guest mounts the share inside.
+//
+// NinePVSockPort, when non-zero, marks the share for the 9p-over-vsock
+// transport: the host runs a ninep server (internal/ninep) rooted at HostPath
+// on that guest vsock port, and a 9p-capable clawk-init mounts it over 9p
+// instead of virtio-fs. The virtio-fs device (Tag) is still attached as the
+// fallback for older guests. Used for the toolchain caches, whose file counts
+// make Apple's virtio-fs exhaust the host's kern.maxfiles. Zero = virtio-fs
+// only (every other share). See ToolchainCacheShares.
 type HostShare struct {
-	HostPath  string
-	Tag       string
-	GuestPath string
-	ReadOnly  bool
+	HostPath       string
+	Tag            string
+	GuestPath      string
+	ReadOnly       bool
+	NinePVSockPort uint32
 }
 
 // HostFile is a single host file snapshotted into the VM at boot from
@@ -204,6 +213,12 @@ func SeedClaudeMemory(stateRoot, seed string) error {
 	return nil
 }
 
+// NinepBasePort is the first guest vsock port used by the host 9p cache
+// servers; each ToolchainCacheShares entry gets NinepBasePort+index. Chosen
+// clear of the fixed control ports (1024 pty-agent, 1025 time-sync, 1026
+// ssh-agent) with headroom so adding a cache never collides.
+const NinepBasePort uint32 = 1100
+
 // ToolchainCacheShares returns host shares that back the dependency
 // caches of common language toolchains. Mounting one host directory per
 // cache means a module/crate is downloaded once and reused across every
@@ -264,7 +279,7 @@ func ToolchainCacheShares(cacheDir string) []HostShare {
 		{"cargo-git-db", "cargo_git_db", GuestHome + "/.cargo/git/db"},
 	}
 	out := make([]HostShare, 0, len(specs))
-	for _, s := range specs {
+	for i, s := range specs {
 		hostPath := filepath.Join(cacheDir, s.sub)
 		if err := os.MkdirAll(hostPath, 0o755); err != nil {
 			continue
@@ -274,6 +289,11 @@ func ToolchainCacheShares(cacheDir string) []HostShare {
 			Tag:       s.tag,
 			GuestPath: s.guest,
 			ReadOnly:  false,
+			// Port is keyed to the cache's position in specs (not the output
+			// index) so a skipped entry never shifts another's port — the
+			// host ninep servers (vzd) and the guest mounts (manifest) both
+			// derive it from the same list and must agree.
+			NinePVSockPort: NinepBasePort + uint32(i),
 		})
 	}
 	return out

@@ -197,6 +197,24 @@ func runVzd(_ *cobra.Command, args []string) (retErr error) {
 		defer sshAgent.Stop()
 	}
 
+	// 9p cache servers: one per toolchain cache, each serving its host cache
+	// dir over 9p on the guest vsock port from ToolchainCacheShares. A
+	// 9p-capable clawk-init mounts these instead of the caches' virtio-fs
+	// shares, avoiding Apple virtio-fs's per-inode host-fd blowup that
+	// exhausts kern.maxfiles (see internal/ninep). Best-effort like the
+	// proxies; the virtio-fs shares stay attached as the older-guest fallback.
+	for _, sh := range sandbox.ToolchainCacheShares(store.CacheDir()) {
+		if sh.NinePVSockPort == 0 {
+			continue
+		}
+		srv, err := startNinepServer(ctx, m, sh.HostPath, sh.NinePVSockPort, logger)
+		if err != nil {
+			logger.Printf("ninep %s: disabled (%v)", sh.Tag, err)
+		} else if srv != nil {
+			defer srv.Stop()
+		}
+	}
+
 	// Wallclock-tick watchdog: detects host sleep events that
 	// mac-sleep-notifier missed (macOS standby is the common offender)
 	// and bounces the VM to recover guest clocks and network state —
