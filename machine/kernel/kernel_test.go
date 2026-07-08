@@ -76,6 +76,54 @@ func TestFetch(t *testing.T) {
 	})
 }
 
+// TestDefaultKernelClawk: with no Override/Version/URL, a published arch
+// resolves to the clawk guest kernel (a raw vmlinux, not the Kata archive),
+// downloaded once and revalidated (304) on the next call.
+func TestDefaultKernelClawk(t *testing.T) {
+	downloads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") == `"k1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		downloads++
+		w.Header().Set("ETag", `"k1"`)
+		_, _ = w.Write([]byte("clawk-vmlinux"))
+	}))
+	defer srv.Close()
+
+	old := DefaultKernelURLs
+	DefaultKernelURLs = map[string]string{"arm64": srv.URL + "/vmlinux-arm64"}
+	defer func() { DefaultKernelURLs = old }()
+
+	opts := Options{CacheDir: t.TempDir(), Arch: "arm64"}
+	got, err := Fetch(context.Background(), opts)
+	require.NoError(t, err, "Fetch default")
+	require.Contains(t, got, "clawk-", "default should use the clawk cache path")
+	data, err := os.ReadFile(got)
+	require.NoError(t, err)
+	require.Equal(t, "clawk-vmlinux", string(data), "downloaded a raw vmlinux, not an archive")
+
+	p, cached := CachedPath(opts)
+	require.True(t, cached, "CachedPath not cached after default fetch")
+	require.Equal(t, got, p, "CachedPath disagrees with Fetch on the default path")
+
+	_, err = Fetch(context.Background(), opts)
+	require.NoError(t, err, "second default Fetch")
+	require.Equal(t, 1, downloads, "default re-downloaded %d times, want 1 (should 304)", downloads)
+}
+
+// TestDefaultKernelFallback: an arch we don't publish routes to the Kata
+// archive path, not the clawk path — no network needed to check the routing.
+func TestDefaultKernelFallback(t *testing.T) {
+	cache := t.TempDir()
+	pub, _ := CachedPath(Options{CacheDir: cache, Arch: "arm64"})
+	require.Contains(t, pub, "clawk-", "published arch should route to the clawk kernel")
+
+	unpub, _ := CachedPath(Options{CacheDir: cache, Arch: "riscv64"})
+	require.Contains(t, unpub, "kata-", "unpublished arch should fall back to the Kata archive")
+}
+
 func TestFetchMissingMember(t *testing.T) {
 	archive := fakeArchive(t, map[string]string{
 		"./opt/kata/share/kata-containers/vmlinux-9.99.9-999": "NEWER KERNEL",

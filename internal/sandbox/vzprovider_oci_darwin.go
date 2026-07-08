@@ -54,6 +54,9 @@ func (v *VZProvider) createOCI(sb *config.Sandbox) error {
 
 	kernelOpts := kernel.Options{CacheDir: v.store.CacheDir(), Arch: runtime.GOARCH, Override: sb.Kernel}
 	kernelLabel := "kata " + kernel.DefaultKataVersion
+	if _, ok := kernel.DefaultKernelURLs[runtime.GOARCH]; ok {
+		kernelLabel = "clawk " + kernel.DefaultKernelVersion
+	}
 	if sb.Kernel != "" {
 		kernelLabel = "override " + sb.Kernel
 	}

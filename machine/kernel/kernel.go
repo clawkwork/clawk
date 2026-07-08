@@ -1,19 +1,24 @@
 // Package kernel fetches and caches guest kernels for [machine.DirectKernel]
 // boot.
 //
-// The default source is the Kata Containers static release — the same
-// kernel Apple's `container machine` boots (see
-// third_party/misc/container ContainerSystemConfig.swift). It is built to
-// host containers inside a VM, which is exactly the clawk shape: virtio-fs
-// (host shares), vsock (agent transport), overlayfs and cgroups are all in,
-// and it boots fast with no initrd. Firecracker-CI kernels, by contrast,
-// lack virtio-fs because firecracker doesn't support it.
+// The default source is the clawk guest kernel published on the
+// clawkwork/clawk releases (see DefaultKernelURLs): a raw, bootable vmlinux
+// built from Kata Containers' known-good config plus the clawk fragments —
+// CONFIG_NET_9P_FD (9p-over-vsock, so the toolchain caches avoid Apple's
+// fd-leaking virtio-fs), fscache, and sound. It boots fast with no initrd and
+// keeps everything the clawk shape needs: virtio-fs (the worktree + config
+// shares), vsock (agent transport), overlayfs and cgroups.
 //
-// The release asset is a ~hundreds-of-MB tar.zst containing the whole Kata
-// runtime; only the vmlinux member is extracted, streamed straight out of
-// the download without touching disk. Results are cached as
+// For an arch we don't publish — and when a caller pins an explicit
+// Version/URL — Fetch falls back to the stock Kata Containers static release
+// (the same kernel Apple's `container machine` boots, see
+// third_party/misc/container ContainerSystemConfig.swift), extracting only the
+// vmlinux member from its ~hundreds-of-MB tar.zst without touching disk.
+// Results are cached as
 //
-//	<CacheDir>/kernels/kata-<version>-<arch>/vmlinux
+//	<CacheDir>/kernels/clawk-<version>-<arch>/vmlinux   (default)
+//	<CacheDir>/kernels/kata-<version>-<arch>/vmlinux    (Kata fallback)
+//	<CacheDir>/kernels/override-<hash>/vmlinux          (clawk.mod override)
 package kernel
 
 import (
@@ -41,6 +46,25 @@ const DefaultKataVersion = "3.28.0"
 // DefaultBinaryPath is the vmlinux member inside the kata-static archive
 // for DefaultKataVersion.
 const DefaultBinaryPath = "opt/kata/share/kata-containers/vmlinux-6.18.15-186"
+
+// DefaultKernelVersion identifies the clawk guest-kernel release used by
+// default. It maps to the git tag guest-kernel-<DefaultKernelVersion> and to
+// the cache path, so bumping the kernel is a one-line change here (plus a new
+// release build). revalidateDownload also re-fetches if the asset at a given
+// tag is republished with new bytes, so a rebuilt-in-place release is picked
+// up without a version bump.
+const DefaultKernelVersion = "6.18.15-snd"
+
+// DefaultKernelURLs maps a guest arch to the clawk guest-kernel release asset:
+// a raw, bootable kernel built from Kata's config plus the clawk fragments
+// (CONFIG_NET_9P_FD for 9p-over-vsock caches, fscache, and sound). This is the
+// default boot kernel — unlike the stock Kata kernel it carries the 9p fd
+// transport, so the toolchain caches mount over 9p instead of Apple's
+// fd-leaking virtio-fs. An arch not listed here falls back to the Kata static
+// archive (DefaultKataVersion), so an unpublished arch still boots.
+var DefaultKernelURLs = map[string]string{
+	"arm64": "https://github.com/clawkwork/clawk/releases/download/guest-kernel-" + DefaultKernelVersion + "/vmlinux-arm64",
+}
 
 // Options control a Fetch.
 type Options struct {
@@ -87,6 +111,21 @@ func Fetch(ctx context.Context, opts Options) (string, error) {
 	if opts.Arch == "" {
 		return "", errors.New("kernel: Options.Arch is required")
 	}
+	// Default to the clawk guest kernel (9p + fscache + sound) for arches we
+	// publish. It's a raw vmlinux, fetched and revalidated like an override.
+	// An explicit Version or URL opts into the stock Kata archive path below.
+	if opts.Version == "" && opts.URL == "" {
+		if url, ok := DefaultKernelURLs[opts.Arch]; ok {
+			dst := defaultKernelPath(opts.CacheDir, opts.Arch)
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return "", fmt.Errorf("kernel: cache dir: %w", err)
+			}
+			if err := revalidateDownload(ctx, url, dst); err != nil {
+				return "", err
+			}
+			return dst, nil
+		}
+	}
 	if opts.Version == "" {
 		opts.Version = DefaultKataVersion
 	}
@@ -126,6 +165,15 @@ func CachedPath(opts Options) (string, bool) {
 		_, err := os.Stat(dst)
 		return dst, err == nil
 	}
+	// Mirror Fetch's default routing: the clawk kernel for a published arch,
+	// the Kata archive otherwise.
+	if opts.Version == "" && opts.URL == "" {
+		if _, ok := DefaultKernelURLs[opts.Arch]; ok {
+			dst := defaultKernelPath(opts.CacheDir, opts.Arch)
+			_, err := os.Stat(dst)
+			return dst, err == nil
+		}
+	}
 	if opts.Version == "" {
 		opts.Version = DefaultKataVersion
 	}
@@ -133,6 +181,13 @@ func CachedPath(opts Options) (string, bool) {
 		fmt.Sprintf("kata-%s-%s", opts.Version, opts.Arch), "vmlinux")
 	_, err := os.Stat(vmlinux)
 	return vmlinux, err == nil
+}
+
+// defaultKernelPath is the cache location for the default clawk kernel,
+// keyed by version and arch so a bump lands at a fresh path.
+func defaultKernelPath(cacheDir, arch string) string {
+	return filepath.Join(cacheDir, "kernels",
+		"clawk-"+DefaultKernelVersion+"-"+arch, "vmlinux")
 }
 
 // fetchOverride resolves a user-supplied kernel. A local path is
