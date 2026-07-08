@@ -1,0 +1,18 @@
+# 9p-over-vsock transport for the host-served toolchain caches.
+#
+# Layered on top of Kata Containers' known-good kernel config (see build.sh),
+# alongside snd.fragment. The stock Kata kernel builds the 9p filesystem and
+# protocol (CONFIG_9P_FS, CONFIG_NET_9P) with only the *virtio* transport
+# (CONFIG_NET_9P_VIRTIO) — but Apple's Virtualization.framework exposes no
+# virtio-9p device, and its virtio-fs implementation leaks a host fd per inode
+# (Apple FB13640480), exhausting the host's kern.maxfiles and panicking the Mac
+# on cache-heavy workloads (see internal/ninep and internal/sandbox/shares.go).
+#
+# CONFIG_NET_9P_FD adds the "fd" transport, which mounts 9p over an already-open
+# file descriptor. clawk-init opens an AF_VSOCK socket to the host 9p server
+# (internal/ninep) and mounts with `-o trans=fd,rfdno=<fd>,wfdno=<fd>`, giving
+# the toolchain caches a shared, write-back mount with none of the virtio-fs fd
+# blowup. AF_VSOCK itself is already enabled (CONFIG_VSOCKETS,
+# CONFIG_VIRTIO_VSOCKETS). Built in (=y), not a module: the clawk guest kernel
+# is monolithic with no /lib/modules to modprobe from.
+CONFIG_NET_9P_FD=y

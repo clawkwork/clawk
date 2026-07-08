@@ -6,6 +6,11 @@ machine/smoke-alpine
 machine/smoke-firecracker
 *.exe
 
+# Guest kernel build scratch + output (images/guest-kernel/build.sh)
+images/guest-kernel/build/
+images/guest-kernel/vmlinux
+images/guest-kernel/vmlinux-*
+
 # Local cruft
 .DS_Store
 /vmlinux-arm64-snd

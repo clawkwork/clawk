@@ -15,14 +15,31 @@
 # arm64 kernel wants an arm64 host (the CI matrix uses ubuntu-24.04-arm).
 set -euo pipefail
 
+# Kata's kernel tooling is Linux-only: it shells out to Linux build utilities
+# and maps `uname -m` through an arch table that knows "aarch64" (Linux) but not
+# "arm64" (what macOS reports) — which is why running this on a Mac dies deep
+# inside Kata with "unsupported architecture: arm64". Building a Linux kernel on
+# macOS would also need a cross-toolchain we don't ship. Fail fast with a
+# pointer instead.
+if [ "$(uname -s)" != "Linux" ]; then
+	cat >&2 <<EOF
+ERROR: the guest kernel must be built on a Linux host, not $(uname -s).
+Ways to build it:
+  - GitHub Actions: the build-guest-kernel workflow (manual dispatch, or push a
+    change under images/guest-kernel/) builds arm64 on ubuntu-24.04-arm.
+  - Or run this on any aarch64 Linux box (a clawk Linux sandbox works).
+EOF
+	exit 1
+fi
+
 KATA_VERSION="${KATA_VERSION:-3.28.0}"
 KERNEL_VERSION="${KERNEL_VERSION:-6.18.15}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FRAGMENT="${FRAGMENT:-$here/snd.fragment}"
+FRAGMENTS="${FRAGMENTS:-$here/snd.fragment $here/ninep.fragment}"
 WORKDIR="${WORKDIR:-$here/build}"
 OUT="${OUT:-$here/vmlinux}"
 
-echo ">> kata $KATA_VERSION, kernel $KERNEL_VERSION, fragment $FRAGMENT"
+echo ">> kata $KATA_VERSION, kernel $KERNEL_VERSION, fragments $FRAGMENTS"
 mkdir -p "$WORKDIR"
 
 # 1. Kata kernel tooling at the pinned release tag.
@@ -39,13 +56,16 @@ cd "$WORKDIR/kata/tools/packaging/kernel"
 ksrc="$(readlink -f kata-linux-* | head -1)"
 test -f "$ksrc/.config" || { echo "no .config in $ksrc after setup" >&2; exit 1; }
 
-# 3. Overlay the sound options and let the kernel resolve dependencies.
-cat "$FRAGMENT" >> "$ksrc/.config"
+# 3. Overlay the sound + 9p-fd options and let the kernel resolve dependencies.
+for frag in $FRAGMENTS; do
+	cat "$frag" >> "$ksrc/.config"
+done
 make -C "$ksrc" olddefconfig
 
 # 4. Confirm the options survived (olddefconfig silently drops options whose
-#    deps are unmet — catch that here instead of shipping a soundless kernel).
-for opt in CONFIG_SND_VIRTIO CONFIG_SND CONFIG_SOUND; do
+#    deps are unmet — catch that here instead of shipping a soundless kernel
+#    or one that can't mount the host-served 9p caches).
+for opt in CONFIG_SND_VIRTIO CONFIG_SND CONFIG_SOUND CONFIG_NET_9P_FD; do
 	grep -q "^${opt}=y" "$ksrc/.config" || {
 		echo "ERROR: ${opt}=y missing after olddefconfig — dependency unmet" >&2
 		exit 1
