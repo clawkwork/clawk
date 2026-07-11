@@ -60,7 +60,7 @@ func New(dir string) (*Server, error) {
 
 	return &Server{
 		root: dir,
-		srv:  p9.NewServer(localfs.Attacher(dir)),
+		srv:  p9.NewServer(chmodAttacher{inner: localfs.Attacher(dir), root: dir}),
 	}, nil
 }
 

@@ -92,6 +92,119 @@ func TestServeReadWriteRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSetAttrChmod is the regression test for the toolchain-exec-bit bug:
+// localfs.SetAttr ENOSYS-es any permission change, so a Go toolchain unpacked
+// into a 9p-mounted GOMODCACHE never becomes executable. The server must apply
+// the chmod to the backing file. Driven through the real p9 client so it
+// exercises the same SetAttr path the guest kernel's 9p client does.
+func TestSetAttrChmod(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "tool"), []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	root9 := attachTestClient(t, root)
+
+	_, tool, err := root9.Walk([]string{"tool"})
+	if err != nil {
+		t.Fatalf("walk tool: %v", err)
+	}
+	if err := tool.SetAttr(p9.SetAttrMask{Permissions: true}, p9.SetAttr{Permissions: 0o755}); err != nil {
+		t.Fatalf("chmod tool: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(root, "tool"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Fatalf("host mode = %o, want %o", got, 0o755)
+	}
+}
+
+// TestSetAttrChmodOnCreatedAndRenamed covers the fid-minting/moving paths the
+// wrapper has to keep straight: a chmod on a fid obtained from Create, and a
+// RenameAt (whose localfs implementation type-asserts its File argument to
+// *Local — a naive wrapper panics here).
+func TestSetAttrChmodOnCreatedAndRenamed(t *testing.T) {
+	root := t.TempDir()
+	root9 := attachTestClient(t, root)
+
+	_, dir, err := root9.Walk(nil) // Create consumes the fid; clone first
+	if err != nil {
+		t.Fatalf("walk clone: %v", err)
+	}
+	created, _, _, err := dir.Create("fresh", p9.WriteOnly, 0o644, p9.UID(os.Getuid()), p9.GID(os.Getgid()))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := created.SetAttr(p9.SetAttrMask{Permissions: true}, p9.SetAttr{Permissions: 0o750}); err != nil {
+		t.Fatalf("chmod created: %v", err)
+	}
+	_ = created.Close()
+	if fi, err := os.Stat(filepath.Join(root, "fresh")); err != nil {
+		t.Fatal(err)
+	} else if got := fi.Mode().Perm(); got != 0o750 {
+		t.Fatalf("created mode = %o, want %o", got, 0o750)
+	}
+
+	// RenameAt within the root: must not panic on the *Local assertion.
+	_, rdir, err := root9.Walk(nil)
+	if err != nil {
+		t.Fatalf("walk clone for rename: %v", err)
+	}
+	if err := rdir.RenameAt("fresh", unwrapDir(t, root9), "moved"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "moved")); err != nil {
+		t.Fatalf("renamed file missing: %v", err)
+	}
+}
+
+// attachTestClient serves root over a unix socket and returns an attached p9
+// client root, cleaning both up when the test ends.
+func attachTestClient(t *testing.T, root string) p9.File {
+	t.Helper()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sock := filepath.Join(t.TempDir(), "9p.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	go func() { _ = s.Serve(l) }()
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	client, err := p9.NewClient(conn)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	root9, err := client.Attach("")
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	t.Cleanup(func() { _ = root9.Close() })
+	return root9
+}
+
+// unwrapDir returns a fresh clone of the root fid to serve as RenameAt's target
+// directory (RenameAt consumes neither fid but needs a live handle to newDir).
+func unwrapDir(t *testing.T, root9 p9.File) p9.File {
+	t.Helper()
+	_, d, err := root9.Walk(nil)
+	if err != nil {
+		t.Fatalf("walk newdir: %v", err)
+	}
+	return d
+}
+
 // TestNewRejectsBadRoot keeps New honest: a missing or non-directory root is a
 // caller bug (the cache dir is created before serving), not something to serve
 // anyway.
