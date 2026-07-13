@@ -58,12 +58,15 @@ sandbox my-project (
 
     shares (
         ~/.aws
+        ~/.claude/skills/idiomatic-go   # a local Claude skill — the working way to provision one
         ~/.config/gcloud     /home/agent/.config/gcloud
         ~/.terraform.d                                   rw
     )
 
     skills (
-        ~/.claude/skills/idiomatic-go
+        # A manifest of distributed skills for `clawk mod tidy` to pin.
+        # Fetching them into the guest is not implemented yet — provision a
+        # skill today with a shares (…) entry, like the one above.
         github.com/anthropics/skills/claude-api    v1.2.3
     )
 
@@ -116,7 +119,12 @@ sandbox my-project (
   configs that rotate rarely).
 - `shares ( … )` — host directories live-mounted via virtio-fs (good for
   rotating secrets like AWS STS tokens).
-- `skills ( … )` — Claude skills to make available, by path.
+- `skills ( … )` — a manifest of **distributed** Claude skills
+  (`<host.tld>/…` pinned to a version), maintained with `clawk mod tidy`.
+  **Fetching skills into the guest is not implemented yet** — until it
+  lands, provision a skill by pointing `shares ( … )` at its directory
+  (which is also why `~/.claude/skills` is not auto-shared). Local
+  `~/…` / `./…` paths parse but are not provisioned by this block today.
 - `agent ( … )` — persistent agent context seeded into the sandbox.
   `instructions` adds CLAUDE.md guidance the agent reads on every boot;
   `memory` seeds the agent's auto-memory once, on first boot, without ever
