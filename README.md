@@ -59,6 +59,11 @@ something it could publish. The
 And if the agent wrecks the VM, run `clawk destroy && clawk`: a fresh VM, same
 repo, and `--resume` restores the conversation.
 
+> [!IMPORTANT]
+> **Pre-1.0 and moving fast.** Expect breaking changes between releases and
+> the occasional rough edge; things can and will break. Please file issues;
+> that feedback is shaping 1.0.
+
 ## Highlights
 
 - **Let the agent do anything.** It runs in a disposable VM with a restricted
@@ -403,8 +408,9 @@ Next up: running more sandboxes than your RAM can hold at once.
 
 ## Status
 
-Pre-1.0 and under active development. The CLI surface is stable; internals
-are not.
+Pre-1.0 and under active development, and evolving quickly: expect breaking
+changes between releases. The CLI surface changes least and internals most,
+but nothing is frozen until 1.0.
 
 ## Contributing
 
