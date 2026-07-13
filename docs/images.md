@@ -27,9 +27,12 @@ local `docker save` tarball.
 
 ## Guest kernel override
 
-The vz provider direct-boots a guest kernel (the Kata Containers kernel
-by default). Override it per sandbox with a local `vmlinux` path or an
-http(s) URL:
+The vz provider direct-boots a guest kernel. By default this is the clawk
+guest kernel: a raw `vmlinux` built from Kata Containers' config plus clawk
+fragments (9p-over-vsock caches, fscache, sound), published on the
+`clawkwork/clawk` releases. For an architecture clawk doesn't publish, it
+falls back to the stock Kata Containers static kernel. Override the kernel
+per sandbox with a local `vmlinux` path or an http(s) URL:
 
 ```sh
 clawk --kernel ~/kernels/vmlinux            # one invocation
@@ -38,8 +41,8 @@ vm ( kernel https://example.com/vmlinux )
 ```
 
 The main use is supplying a **KVM-enabled** kernel for nested
-virtualization: the stock Kata kernel ships with KVM disabled, so the
-guest has no `/dev/kvm`. A KVM-capable kernel (plus an M3-or-newer Mac on
-macOS 15+ with `nested` in clawk.mod) is what lets you run Docker/KVM or
+virtualization: the default kernel (like stock Kata) ships with KVM disabled,
+so the guest has no `/dev/kvm`. A KVM-capable kernel (plus an M3-or-newer Mac
+on macOS 15+ with `nested` in clawk.mod) is what lets you run Docker/KVM or
 firecracker *inside* a sandbox. The override must be a raw `vmlinux` with
-virtio-fs/vsock/virtio-blk built in (so it direct-boots like Kata's).
+virtio-fs/vsock/virtio-blk built in (so it direct-boots like the default).

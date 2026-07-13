@@ -9,6 +9,40 @@ tagged.
 
 _Nothing yet._
 
+## v0.2.0
+
+### Changed
+
+- **Default guest kernel is now the clawk kernel.** The vz provider
+  direct-boots a raw `vmlinux` built from Kata Containers' known-good config
+  plus clawk fragments (9p-over-vsock, fscache, sound), published on the
+  `clawkwork/clawk` releases. Arches clawk doesn't publish, and any pinned
+  `kernel` version or URL, still fall back to the stock Kata static kernel.
+- **Toolchain caches are served over 9p-over-vsock instead of virtio-fs.**
+  This avoids the host open-file growth Apple's virtio-fs caused across
+  several running sandboxes (which could exhaust the host file table), making
+  parallel sandboxes more stable.
+
+### Added
+
+- **chmod/chown over 9p.** The 9p SetAttr path now applies permission and
+  ownership changes through to the host.
+- **Revalidated override-kernel downloads.** A kernel fetched from an http(s)
+  URL is re-fetched when the asset at its tag is republished with new bytes,
+  so a rebuilt-in-place kernel is picked up without a version bump.
+
+### Fixed
+
+- Test unix sockets now use a short path, fixing a macOS CI failure where the
+  9p socket exceeded the `sun_path` length limit.
+
+### Docs
+
+- README rewritten for launch (autonomy trade-off framing, "Why a VM?" and
+  "Compared to" sections) with a pre-1.0 stability notice.
+- Corrected the `clawk.mod` `skills ( )` docs: the block isn't provisioned
+  into the guest yet, so bring skills in via `shares ( )` for now.
+
 ## v0.1.0 — first public release
 
 clawk gives every project (or ticket) a disposable Linux microVM with the
