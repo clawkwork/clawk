@@ -27,7 +27,7 @@ func TestServeReadWriteRoundTrip(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	sock := filepath.Join(t.TempDir(), "9p.sock")
+	sock := tempSock(t)
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -163,13 +163,26 @@ func TestSetAttrChmodOnCreatedAndRenamed(t *testing.T) {
 
 // attachTestClient serves root over a unix socket and returns an attached p9
 // client root, cleaning both up when the test ends.
+// tempSock returns a unix-socket path short enough for macOS's ~104-byte
+// sun_path limit. t.TempDir() embeds the (long) test name and can overflow it,
+// surfacing as "bind: invalid argument" on darwin.
+func tempSock(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "9p")
+	if err != nil {
+		t.Fatalf("mkdir temp sock: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "s")
+}
+
 func attachTestClient(t *testing.T, root string) p9.File {
 	t.Helper()
 	s, err := New(root)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	sock := filepath.Join(t.TempDir(), "9p.sock")
+	sock := tempSock(t)
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
