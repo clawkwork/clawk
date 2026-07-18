@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strconv"
 	"time"
+
+	"github.com/clawkwork/clawk/internal/envspec"
 )
 
 // FileSpec is one entry in a `files (...)` block: a host file copied
@@ -94,7 +96,7 @@ type Template struct {
 	// block.
 	DenySources []string
 	Forwards    []string // port forward specs (PORT or HOST:GUEST)
-	Env         []string // env var NAMES (not values) to pull from host and export in the VM
+	Env         []string // env entries to export in the VM (canonical envspec form; see parseEnvBlock)
 
 	// Lifecycle hooks. Each is a list of shell commands run inside the
 	// VM at the named moment.
@@ -291,12 +293,12 @@ func (p *parser) parseTemplateDirective(tmpl *Template, t Token) error {
 	case "agent":
 		return p.parseAgentBlock(tmpl)
 	case "env":
-		// env ( FOO BAR BAZ )  or  env FOO
-		// Values come from the host shell at `clawk run / up` time;
-		// the Clawkfile only names which variables the project needs.
-		// Never persisted as values — avoids checking secrets into repo
-		// config. Names must be shell-variable shaped (validateEnvName).
-		return p.parseValidatedIdentBlock(&tmpl.Env, "env", validateEnvName)
+		// env ( FOO  GH=${HOST}  LOG=${LOG:-info}  ED=vim )  or  env FOO
+		// Values come from the host shell at `clawk run / up` time; the
+		// Clawkfile only names which variables the project needs (and,
+		// optionally, how to map/default them). Never persisted as values
+		// — avoids checking secrets into repo config. See envspec.
+		return p.parseEnvBlock(&tmpl.Env)
 	case "apps", "app":
 		// Previous iteration's directives — explicitly rejected so users
 		// migrating from an older Clawkfile get a clear message pointing
@@ -381,24 +383,93 @@ func (p *parser) parseValidatedIdentBlock(dst *[]string, directive string, valid
 	}
 }
 
-// validateEnvName enforces the POSIX shell variable-name shape on `env`
-// entries. Deliberately NOT uppercase-only: lowercase names like
-// http_proxy are legitimate. Enforced at parse time because an invalid
-// name written here would otherwise fail much later, inside the guest's
-// generated profile script, where the error is far harder to trace.
-func validateEnvName(s string) error {
-	for i, r := range s {
-		switch {
-		case r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
-		case r >= '0' && r <= '9':
-			if i == 0 {
-				return fmt.Errorf("invalid env name %q: must not start with a digit", s)
-			}
-		default:
-			return fmt.Errorf("invalid env name %q: names only (letters, digits, '_'), values come from the host shell", s)
+// parseEnvBlock parses an `env ( … )` block (or the inline `env ENTRY`
+// form). Each entry is either a bare name (passthrough of the same host
+// variable) or `NAME = VALUE`, where VALUE is a ${…} host reference — with
+// optional :- / - / :? / ? operator — a bare literal, or a quoted literal.
+// See package envspec for the full grammar.
+//
+// Entries are stored in their canonical envspec.String() form, so the rest
+// of the pipeline keeps treating the env list as a plain []string (dedup,
+// union, and JSON persistence stay oblivious to the structure). Validating
+// here — rather than in the guest's generated profile script — keeps a bad
+// entry's error on its own source line where it is easy to trace.
+func (p *parser) parseEnvBlock(dst *[]string) error {
+	p.advance() // consume "env"
+	t := p.peek()
+
+	// Inline form: `env ENTRY`
+	if t.Kind == TokIdent {
+		entry, err := p.parseEnvEntry()
+		if err != nil {
+			return err
 		}
+		*dst = append(*dst, entry)
+		return p.expectNewlineOrEOF()
 	}
-	return nil
+
+	// Block form: `env ( … )`
+	if t.Kind != TokLParen {
+		return p.errorAt(t, "expected '(' or identifier after %q, got %s", "env", t)
+	}
+	p.advance()
+	for {
+		p.skipNewlines()
+		t := p.peek()
+		if t.Kind == TokRParen {
+			p.advance()
+			return p.expectNewlineOrEOF()
+		}
+		if t.Kind != TokIdent {
+			return p.errorAt(t, "expected env entry or ')' in %q, got %s", "env", t)
+		}
+		entry, err := p.parseEnvEntry()
+		if err != nil {
+			return err
+		}
+		*dst = append(*dst, entry)
+	}
+}
+
+// parseEnvEntry consumes one env entry — `NAME` or `NAME = VALUE` — and
+// returns its canonical text. The caller has confirmed the next token is
+// the name identifier.
+func (p *parser) parseEnvEntry() (string, error) {
+	nameTok := p.peek()
+	if isKeyword(nameTok.Val) {
+		return "", p.errorAt(nameTok, "unexpected keyword %q in %q", nameTok.Val, "env")
+	}
+	p.advance()
+
+	// Bare name → passthrough of the same-named host variable.
+	if p.peek().Kind != TokEquals {
+		spec, err := envspec.Parse(nameTok.Val)
+		if err != nil {
+			return "", p.errorAt(nameTok, "%v", err)
+		}
+		return spec.String(), nil
+	}
+	p.advance() // consume '='
+
+	valTok := p.peek()
+	var rhs string
+	switch valTok.Kind {
+	case TokIdent:
+		rhs = valTok.Val
+	case TokString:
+		// The lexer already stripped the quotes; re-quote so envspec reads
+		// it back as a literal rather than a bare word or ${…} reference.
+		rhs = envspec.Quote(valTok.Val)
+	default:
+		return "", p.errorAt(valTok, "expected a value after '=' in %q, got %s", "env", valTok)
+	}
+	p.advance()
+
+	spec, err := envspec.Parse(nameTok.Val + "=" + rhs)
+	if err != nil {
+		return "", p.errorAt(nameTok, "%v", err)
+	}
+	return spec.String(), nil
 }
 
 func (p *parser) parseProvider(tmpl *Template) error {

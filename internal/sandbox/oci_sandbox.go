@@ -171,7 +171,11 @@ func OCIGuestManifest(sb *config.Sandbox, stateDir, cacheDir, rootDir string) (g
 	token, _ := LoadOAuthToken(rootDir)
 	files := append(DefaultHostFiles(rootDir), WorkspaceDocFile(sb))
 	files = append(files, ClaudeJSONMarkerFile(sb.Phases, token != ""))
-	if envFile, ok := EnvFile(sb); ok {
+	envFile, ok, err := EnvFile(sb)
+	if err != nil {
+		return guestcfg.Manifest{}, err
+	}
+	if ok {
 		files = append(files, envFile)
 	}
 	for _, f := range files {

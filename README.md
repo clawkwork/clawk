@@ -255,7 +255,8 @@ sandbox my-project (
     )
     network ( allow api.example.com )
     forwards ( 3000 )
-    env ( DATABASE_URL )            # names only; values come from your shell
+    env ( DATABASE_URL )            # forward a host var; values come from your shell
+    # also: GH=${OTHER_NAME}, LOG=${LOG:-info} defaults, API=${API:?required}
     on create ( "go mod download" )
     agent (
         instructions "Ask before running destructive commands."

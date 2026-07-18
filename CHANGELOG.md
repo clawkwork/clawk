@@ -7,7 +7,23 @@ tagged.
 
 ## Unreleased
 
-_Nothing yet._
+### Added
+
+- **`env ( … )` gains aliases, defaults, and literals.** Entries now use
+  shell / docker-compose parameter-expansion syntax: `NAME = ${HOST}` aliases
+  a differently-named host variable, `${HOST:-default}` / `${HOST-default}`
+  supply a fallback, `${HOST:?message}` / `${HOST?message}` make a variable
+  required (failing sandbox creation with a message when missing), and a bare
+  or quoted right-hand side (`EDITOR = vim`) sets a literal constant. Bare
+  `NAME` passthrough is unchanged.
+
+### Fixed
+
+- **Forwarded `env ( … )` vars now reach the agent user.** The generated
+  `/etc/profile.d/99-clawk-env.sh` was written `0600 root:root`, so the
+  agent's login shells silently skipped it and the variables never arrived.
+  It is now `0644`, matching the working OAuth-token export
+  (clawkwork/clawk#4).
 
 ## v0.2.0
 

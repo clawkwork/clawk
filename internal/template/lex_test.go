@@ -52,6 +52,40 @@ allow (
 	}
 }
 
+// TestLexEnvValues covers the two lexer additions for the env compose
+// syntax: a standalone '=' token, and ${…} scanning as one identifier
+// even when it contains spaces (so a default like ${VAR:-a b} survives).
+func TestLexEnvValues(t *testing.T) {
+	toks, err := Lex("GH = ${ACME_GH_TOKEN:-a default}\n")
+	require.NoError(t, err)
+
+	var kinds []TokenKind
+	var idents []string
+	for _, tok := range toks {
+		if tok.Kind == TokEOF || tok.Kind == TokNewline {
+			continue
+		}
+		kinds = append(kinds, tok.Kind)
+		if tok.Kind == TokIdent {
+			idents = append(idents, tok.Val)
+		}
+	}
+	require.Equal(t, []TokenKind{TokIdent, TokEquals, TokIdent}, kinds)
+	require.Equal(t, []string{"GH", "${ACME_GH_TOKEN:-a default}"}, idents)
+
+	// A '=' with no surrounding spaces still splits into three tokens.
+	toks, err = Lex("GH=${X}\n")
+	require.NoError(t, err)
+	require.Equal(t, TokIdent, toks[0].Kind)
+	require.Equal(t, "GH", toks[0].Val)
+	require.Equal(t, TokEquals, toks[1].Kind)
+	require.Equal(t, "${X}", toks[2].Val)
+
+	// An unterminated ${ is a lex error, not a silently truncated token.
+	_, err = Lex("GH = ${X\n")
+	require.Error(t, err)
+}
+
 func TestLexComments(t *testing.T) {
 	// Every comment form must strip to the same two identifiers. A lone '/'
 	// in a path is NOT a comment — only "//" and "/*" open one.
