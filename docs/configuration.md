@@ -71,7 +71,11 @@ sandbox my-project (
     )
 
     env (
-        GITHUB_TOKEN
+        GITHUB_TOKEN                       # forward host $GITHUB_TOKEN as-is
+        GH_TOKEN  = ${ACME_GH_TOKEN}       # alias: read a differently-named host var
+        LOG_LEVEL = ${LOG_LEVEL:-info}      # default when unset or empty
+        API_KEY   = ${API_KEY:?set it}      # required — fails create if missing
+        EDITOR    = vim                     # literal constant
     )
 
     on create (
@@ -106,10 +110,26 @@ sandbox my-project (
   plus `use <policy>…` chains — see
   [Networking](networking.md#policies-and-use-chains).
 - `forwards ( … )` — port forwards (`PORT` or `HOST:GUEST`).
-- `env ( … )` — host env-var **names** to forward in. Values come from your
-  shell at boot; the file never stores secrets. Names must be
+- `env ( … )` — environment variables to export inside the VM. Secret
+  *values* come from your shell at boot and are never written to disk on the
+  host; only names, defaults, and literals live in the file. Each entry uses
+  shell / docker-compose parameter-expansion syntax:
+    - `NAME` — forward the identically-named host variable.
+    - `NAME = ${HOST}` — alias: forward host `$HOST` under a different guest
+      name.
+    - `NAME = ${HOST:-default}` — use `default` when `$HOST` is unset **or**
+      empty; `${HOST-default}` falls back only when it is unset.
+    - `NAME = ${HOST:?message}` — require `$HOST`; a missing value fails
+      sandbox creation with `message` (`${HOST?message}` treats only unset,
+      not empty, as missing).
+    - `NAME = value` / `NAME = "value with spaces"` — a literal constant, no
+      host lookup.
+
+  Host variables are referenced only through `${…}`; a bare or quoted
+  right-hand side is always a literal. Names (both sides) must be
   shell-variable shaped (letters, digits, `_`; not starting with a digit) —
-  lowercase names like `http_proxy` are fine.
+  lowercase names like `http_proxy` are fine. Whitespace around `=` is
+  optional.
 - `on create ( … )` / `on up ( … )` — shell hooks. `create` runs once after
   the first boot; `up` runs on every boot. Each command runs inside the
   guest via `bash -lc` as a login shell: variable expansion, globs, and

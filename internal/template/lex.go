@@ -50,6 +50,7 @@ const (
 	TokNewline
 	TokLParen
 	TokRParen
+	TokEquals // '=', separates an env entry's name from its value
 	TokIdent
 	TokString // double-quoted, supports \" \\ \n \t escapes
 )
@@ -64,6 +65,8 @@ func (k TokenKind) String() string {
 		return "'('"
 	case TokRParen:
 		return "')'"
+	case TokEquals:
+		return "'='"
 	case TokIdent:
 		return "identifier"
 	case TokString:
@@ -168,6 +171,14 @@ func Lex(src string) ([]Token, error) {
 			emit(TokRParen, "", line, col)
 			i++
 			col++
+		case r == '=':
+			// Standalone '='. Used by env entries (`NAME = ${HOST}`); a '='
+			// inside a quoted string never reaches here (the '"' case above
+			// consumes the whole string first), so existing values that
+			// embed '=' — shell commands in `on ( … )` etc. — are untouched.
+			emit(TokEquals, "", line, col)
+			i++
+			col++
 		case r == '"':
 			// Double-quoted string with simple backslash escapes.
 			startLine, startCol := line, col
@@ -209,13 +220,41 @@ func Lex(src string) ([]Token, error) {
 			}
 			return nil, fmt.Errorf("line %d col %d: unterminated string", startLine, startCol)
 		default:
-			// Identifier: run until whitespace, a paren, or a quote.
+			// Identifier: run until whitespace, a paren, a quote, or '='.
 			startLine, startCol := line, col
 			start := i
 			for i < n {
 				c := src[i]
+				// A ${…} parameter reference scans as one unit — braces and
+				// all — so an env value like ${VAR:-a default} stays a single
+				// identifier even though it contains spaces. Nesting is
+				// tracked so ${FOO:-${BAR}} would balance, though shells
+				// rarely nest here.
+				if c == '$' && i+1 < n && src[i+1] == '{' {
+					i += 2
+					col += 2
+					depth := 1
+					for i < n && depth > 0 {
+						switch src[i] {
+						case '{':
+							depth++
+						case '}':
+							depth--
+						case '\n':
+							return nil, fmt.Errorf(
+								"line %d col %d: unterminated ${…}", startLine, startCol)
+						}
+						i++
+						col++
+					}
+					if depth != 0 {
+						return nil, fmt.Errorf(
+							"line %d col %d: unterminated ${…}", startLine, startCol)
+					}
+					continue
+				}
 				if c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-					c == '(' || c == ')' || c == '#' || c == '"' {
+					c == '(' || c == ')' || c == '#' || c == '"' || c == '=' {
 					break
 				}
 				// '/' is an ordinary identifier byte. "//" and "/*" open a

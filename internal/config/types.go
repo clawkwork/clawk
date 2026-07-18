@@ -477,12 +477,14 @@ type Sandbox struct {
 	// instead of hitting an in-guest version error mid-boot. Zero means
 	// the record predates the field: ABI 1.
 	GuestABI int `json:"guest_abi,omitempty"`
-	// RequiredEnv holds the names (not values) of host env vars this
-	// sandbox wants exported inside the VM. Declared in clawk.mod via
-	// `env ( NAME ... )`. Values are read from the host shell at
-	// sandbox-create time and written to /etc/profile.d/99-clawk-env.sh
-	// in the guest — never persisted to disk on the host alongside the
-	// name so we don't check secrets into the sandbox state file.
+	// RequiredEnv holds the env entries this sandbox wants exported inside
+	// the VM, declared in clawk.mod via `env ( … )`. Each string is a
+	// canonical envspec entry — a bare name like "GITHUB_TOKEN" (passthrough),
+	// an alias/default like "GH=${ACME_GH_TOKEN:-}" or a literal like
+	// "EDITOR=vim". Only names and defaults/literals are stored: secret
+	// *values* are read from the host shell at sandbox-create/up time and
+	// written to /etc/profile.d/99-clawk-env.sh in the guest, never persisted
+	// to the sandbox state file. See internal/envspec.
 	RequiredEnv []string `json:"required_env,omitempty"`
 	// NestedVirt opts the VM into hardware-assisted nested
 	// virtualization so the guest can run its own VMs (Docker with KVM,

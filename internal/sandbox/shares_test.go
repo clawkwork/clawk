@@ -3,8 +3,10 @@ package sandbox
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/clawkwork/clawk/internal/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -106,5 +108,116 @@ func TestToolchainCacheSharesUniqueTags(t *testing.T) {
 			continue
 		}
 		seen[sh.Tag] = sh.HostPath
+	}
+}
+
+func TestEnvFileNoRequiredEnv(t *testing.T) {
+	if _, ok, err := EnvFile(&config.Sandbox{Name: "sb"}); ok || err != nil {
+		t.Fatalf("EnvFile with no RequiredEnv: ok=%v err=%v, want false/nil", ok, err)
+	}
+}
+
+// TestEnvFileAgentReadable is the regression guard for
+// clawkwork/clawk#4: 99-clawk-env.sh was written 0600 root:root, so the
+// agent's login shells (which run /etc/profile as the non-root `agent`
+// user) silently skipped it and the forwarded vars never arrived. The
+// file must be readable by the agent — i.e. carry the world-read bit,
+// since agent is neither root nor in root's group — exactly like the
+// sibling OAuth export 98-clawk-claude-oauth.sh.
+func TestEnvFileAgentReadable(t *testing.T) {
+	t.Setenv("CLAWK_TEST_TOKEN", "s3cr3t")
+	t.Setenv("CLAWK_TEST_MISSING", "") // present-but-empty is fine
+	os.Unsetenv("CLAWK_TEST_MISSING")
+
+	hf, ok, err := EnvFile(&config.Sandbox{
+		Name:        "sb",
+		RequiredEnv: []string{"CLAWK_TEST_TOKEN", "CLAWK_TEST_MISSING"},
+	})
+	if err != nil || !ok {
+		t.Fatalf("EnvFile: ok=%v err=%v", ok, err)
+	}
+	if hf.GuestPath != "/etc/profile.d/99-clawk-env.sh" {
+		t.Errorf("GuestPath = %q", hf.GuestPath)
+	}
+	if hf.Mode != 0o644 {
+		t.Errorf("Mode = %o, want 0644 (agent-readable, matching the OAuth export)", hf.Mode)
+	}
+	if hf.Mode&0o004 == 0 {
+		t.Errorf("Mode = %o lacks the other-read bit; the non-root agent user can't source it", hf.Mode)
+	}
+	content := string(hf.Content)
+	if !strings.Contains(content, `export CLAWK_TEST_TOKEN="s3cr3t"`) {
+		t.Errorf("missing export for a set var:\n%s", content)
+	}
+	if !strings.Contains(content, `export CLAWK_TEST_MISSING=""`) {
+		t.Errorf("missing empty export for an unset var:\n%s", content)
+	}
+}
+
+func TestEnvFileEscapesShellMetachars(t *testing.T) {
+	t.Setenv("CLAWK_TEST_WEIRD", `val"with$weird\meta`+"`stuff`")
+	hf, ok, err := EnvFile(&config.Sandbox{
+		Name:        "sb",
+		RequiredEnv: []string{"CLAWK_TEST_WEIRD"},
+	})
+	if err != nil || !ok {
+		t.Fatalf("EnvFile: ok=%v err=%v", ok, err)
+	}
+	content := string(hf.Content)
+	for _, want := range []string{`\"`, `\$`, `\\`, "\\`"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("missing escape %q in:\n%s", want, content)
+		}
+	}
+}
+
+// TestEnvFileComposeModel exercises the envspec grammar end to end
+// through EnvFile: alias, :- default (applied and skipped), and a bare
+// literal — checking the generated export lines use the guest-side name
+// and the resolved value.
+func TestEnvFileComposeModel(t *testing.T) {
+	t.Setenv("HOST_GH", "ghp_xyz")
+	os.Unsetenv("HOST_MISSING")
+	t.Setenv("HOST_SET", "present")
+
+	hf, ok, err := EnvFile(&config.Sandbox{
+		Name: "sb",
+		RequiredEnv: []string{
+			"GH_TOKEN=${HOST_GH}",             // alias
+			"LOG_LEVEL=${HOST_MISSING:-info}", // default applied (unset)
+			"MODE=${HOST_SET:-fallback}",      // default skipped (set)
+			"EDITOR=vim",                      // literal
+		},
+	})
+	if err != nil || !ok {
+		t.Fatalf("EnvFile: ok=%v err=%v", ok, err)
+	}
+	content := string(hf.Content)
+	for _, want := range []string{
+		`export GH_TOKEN="ghp_xyz"`,
+		`export LOG_LEVEL="info"`,
+		`export MODE="present"`,
+		`export EDITOR="vim"`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("missing line %q in:\n%s", want, content)
+		}
+	}
+}
+
+// TestEnvFileRequiredMissingErrors verifies that a ${HOST:?msg} whose
+// host variable is unset fails EnvFile (and therefore sandbox creation)
+// with a message that includes the author's note.
+func TestEnvFileRequiredMissingErrors(t *testing.T) {
+	os.Unsetenv("HOST_REQUIRED")
+	_, _, err := EnvFile(&config.Sandbox{
+		Name:        "sb",
+		RequiredEnv: []string{"API_KEY=${HOST_REQUIRED:?set it in your shell}"},
+	})
+	if err == nil {
+		t.Fatal("expected error for required-but-missing env var")
+	}
+	if !strings.Contains(err.Error(), "set it in your shell") {
+		t.Errorf("error missing the author's note: %v", err)
 	}
 }

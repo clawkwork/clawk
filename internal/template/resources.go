@@ -374,7 +374,7 @@ func (p *parser) parseNamespaceBlock() (NamespaceDef, error) {
 		case "shares":
 			err = p.parseSharesBlock(def.Template)
 		case "env":
-			err = p.parseValidatedIdentBlock(&def.Template.Env, "env", validateEnvName)
+			err = p.parseEnvBlock(&def.Template.Env)
 		case "agent":
 			err = p.parseAgentBlock(def.Template)
 		case "vm", "includes", "on":

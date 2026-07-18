@@ -136,6 +136,50 @@ includes ~/code/app
 	}
 }
 
+// TestParseEnvComposeModel covers the full env grammar — passthrough,
+// alias, :- / - defaults, :? required, and bare/quoted literals — and
+// checks each entry is stored in canonical envspec form. Whitespace
+// around '=' is flexible (the lexer emits a standalone '=' token), and a
+// ${…} value may contain spaces because it scans as one unit.
+func TestParseEnvComposeModel(t *testing.T) {
+	src := `env (
+    NPM_TOKEN
+    GH_TOKEN  = ${ACME_GH_TOKEN}
+    LOG_LEVEL = ${LOG_LEVEL:-info}
+    PORT      = ${PORT-8080}
+    API_KEY   = ${API_KEY:?set it in your shell}
+    EDITOR=vim
+    BANNER    = "hi there"
+)
+`
+	tmpl, err := parseBody(src)
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"NPM_TOKEN",
+		"GH_TOKEN=${ACME_GH_TOKEN}",
+		"LOG_LEVEL=${LOG_LEVEL:-info}",
+		"PORT=${PORT-8080}",
+		"API_KEY=${API_KEY:?set it in your shell}",
+		"EDITOR=vim",
+		`BANNER="hi there"`,
+	}, tmpl.Env)
+}
+
+// TestParseEnvErrors: malformed env entries fail at parse time with a
+// traceable message rather than surfacing later in the guest.
+func TestParseEnvErrors(t *testing.T) {
+	for _, src := range []string{
+		"env ( 1BAD )\n",           // bad name
+		"env ( GH = ${1BAD} )\n",   // bad host name
+		"env ( GH = ${HOST:x} )\n", // unknown operator
+		"env ( GH = )\n",           // missing value
+	} {
+		if _, err := parseBody(src); err == nil {
+			t.Errorf("parseBody(%q) = nil error, want failure", src)
+		}
+	}
+}
+
 // TestParseNetworkAccumulates: allow/deny entries within a network block
 // accumulate into the domain/IP slices.
 func TestParseNetworkAccumulates(t *testing.T) {
