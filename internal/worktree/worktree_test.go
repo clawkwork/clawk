@@ -13,11 +13,13 @@ import (
 func initTestRepo(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "repo")
-	mustGit(t, "init", dir)
+	// Initial commit on main; init -b pins the name so the later checkouts
+	// work on every git build (Apple Git inits "main", stock Linux git
+	// "master").
+	mustGit(t, "init", "-b", "main", dir)
 	mustGit(t, "-C", dir, "config", "user.email", "test@test.com")
 	mustGit(t, "-C", dir, "config", "user.name", "Test")
 
-	// Initial commit on main
 	os.WriteFile(filepath.Join(dir, "file.txt"), []byte("v1"), 0o644)
 	mustGit(t, "-C", dir, "add", ".")
 	mustGit(t, "-C", dir, "commit", "-m", "init")
@@ -27,7 +29,7 @@ func initTestRepo(t *testing.T) string {
 	os.WriteFile(filepath.Join(dir, "file.txt"), []byte("v2"), 0o644)
 	mustGit(t, "-C", dir, "add", ".")
 	mustGit(t, "-C", dir, "commit", "-m", "feature change")
-	mustGit(t, "-C", dir, "checkout", "master")
+	mustGit(t, "-C", dir, "checkout", "main")
 
 	return dir
 }
@@ -128,7 +130,7 @@ func TestRemoveAll(t *testing.T) {
 
 	// Create feature2 branch from feature
 	mustGit(t, "-C", repo, "checkout", "-b", "feature2")
-	mustGit(t, "-C", repo, "checkout", "master")
+	mustGit(t, "-C", repo, "checkout", "main")
 
 	wt1, err := Add(repo, "feature", wtBase, "")
 	require.NoError(t, err)
